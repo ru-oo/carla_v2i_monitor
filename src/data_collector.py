@@ -14,6 +14,7 @@ data_collector.py
     - data/vehicle_images/ 폴더 내 차종별 이미지 (car/, truck/)
 """
 
+# test_git
 import carla
 import random
 import time
