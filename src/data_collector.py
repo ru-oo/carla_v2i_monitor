@@ -160,10 +160,6 @@ def is_valid_vehicle_actor(vehicle) -> bool:
     return True
 
 
-def get_vehicle_label(blueprint_id: str) -> str:
-    return "truck" if is_truck(blueprint_id) else "car"
-
-
 def setup_output_dirs():
     """학습 데이터 저장 폴더 생성"""
     for sub in ["car", "truck"]:
