@@ -1,6 +1,6 @@
 # =============================================
 # CARLA V2I Monitor - 의존성 패키지
-# Python 3.10 권장
+# Python 3.12 권장
 # =============================================
 
 # 컴퓨터 비전
@@ -20,5 +20,5 @@ Pillow>=10.0.0
 # CARLA Python API는 pip로 설치하지 않습니다.
 # CARLA 설치 디렉토리의 PythonAPI 경로를 PYTHONPATH에 직접 추가하세요.
 # 예시:
-#   export PYTHONPATH=$PYTHONPATH:/opt/carla-simulator/PythonAPI/carla/dist/carla-0.9.16-py3.10-linux-x86_64.egg
+#   export PYTHONPATH=$PYTHONPATH:/opt/carla-simulator/PythonAPI/carla/dist/carla-0.9.16-py3.12-linux-x86_64.egg
 # =============================================
