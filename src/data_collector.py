@@ -14,6 +14,8 @@ data_collector.py
 산출물:
     - data/vehicle_images/car/   ← 승용차 크롭 이미지
     - data/vehicle_images/truck/ ← 트럭 크롭 이미지
+    - data/vehicle_images/van/   ← 밴 크롭 이미지
+    - data/vehicle_images/bus/   ← 버스 크롭 이미지
     - data/raw/                  ← 원본 프레임 저장 (선택)
 
 실행 방법:
@@ -22,6 +24,7 @@ data_collector.py
 """
 
 import carla
+import itertools
 import random
 import time
 import os
@@ -54,27 +57,33 @@ RAW_DIR       = "data/raw"
 SAVE_RAW      = False           # 원본 프레임도 저장할지 여부
 
 # --- BBox 필터링 ---
-MIN_BBOX_PX      = 25           # 30 → 25 (CCTV 뷰에서 멀리 보이는 차량도 수집)
-MAX_BBOX_PX      = 500          # 400 → 500 (트럭 전체가 한 장에 들어오도록)
+MIN_BBOX_PX      = 20           # 30 → 20 (CCTV 뷰에서 멀리 보이는 차량도 수집)
+MAX_BBOX_PX      = 1000          # 400 → 1000 (트럭/버스 전체가 한 장에 들어오도록)
 CAPTURE_COOLDOWN = 0.5          # 1.0 → 0.5초 (더 많은 각도/장면 수집)
 
 # --- 시뮬레이션 규모 ---
-NUM_NPC       = 80              # 40 → 80 (차량 수 증가)
+NUM_NPC       = 100              # 40 → 100 (차량 수 증가)
 SIM_DURATION  = 300             # 180 → 300초 (더 많은 데이터 수집)
 
-# 화면 표시용 색상 (BGR)
-COLOR_CAR    = (0, 255, 0)      # 초록
-COLOR_TRUCK  = (0, 100, 255)    # 주황
-COLOR_OTHER  = (200, 200, 200)
+# --- 수집 대상 차종 (CARLA base_type 기준) ---
+# car / truck / van / bus 4개 클래스를 각각 개별 폴더에 수집
+TARGET_CLASSES   = ["car", "truck", "van", "bus"]
+VALID_BASE_TYPES = set(TARGET_CLASSES)   # 수집 대상 base_type 집합
 
-# 트럭 계열 base_type 값 (CARLA blueprint 속성)
-TRUCK_BASE_TYPES = {"truck", "van", "bus"}
-
-# 이륜차 base_type 값 (CARLA blueprint 속성) — 키워드 매칭보다 정확
+# 이륜차 base_type 값 (CARLA blueprint 속성) — 수집 완전 제외
 EXCLUDE_BASE_TYPES = {"motorcycle", "bicycle"}
 
+# 화면 표시용 색상 (BGR) — 클래스별
+CLASS_COLORS = {
+    "car":   (0, 255, 0),       # 초록
+    "truck": (0, 100, 255),     # 주황
+    "van":   (0, 220, 255),     # 노랑
+    "bus":   (255, 0, 200),     # 보라
+    "other": (200, 200, 200),
+}
+
 # --- 수집 목표량 (클래스당) ---
-# 학습 데이터 균형을 위해 car / truck 동일 수량 수집
+# 4개 클래스 균등 수집 (car / truck / van / bus 각 5,000장 = 총 20,000장)
 TARGET_PER_CLASS = 5000    # 클래스당 수집 목표 장수
 
 # --- 날씨 로테이션 설정 ---
@@ -92,6 +101,15 @@ WEATHER_PRESETS = [
 # 20fps 기준 400 프레임 ≈ 20초마다 날씨 변경
 # 300초 수집 시 약 15회 변경 → 7가지 날씨를 2회 이상 순환
 WEATHER_CHANGE_INTERVAL = 400  # 날씨 변경 주기 (프레임 단위)
+
+# --- 맵 로테이션 설정 ---
+# CARLA 공식 지원 일반 도심 맵 8종 전체 순환
+MAP_LIST = [
+    "Town01", "Town02", "Town03", "Town04", 
+    "Town05", "Town06", "Town07", "Town10HD"
+]
+
+FRAMES_PER_MAP = 6000  # 맵당 수집 프레임 수
 
 
 # =============================================
@@ -119,41 +137,49 @@ def get_base_type_from_actor(vehicle) -> str:
     return vehicle.attributes.get("base_type", "").lower()
 
 
-def is_truck_bp(bp) -> bool:
-    """블루프린트 객체로 트럭/대형차 여부 판단 (스폰 단계용)"""
-    return get_base_type_from_bp(bp) in TRUCK_BASE_TYPES
+def get_vehicle_class_bp(bp) -> str:
+    """
+    블루프린트 객체의 수집 클래스 반환 (스폰/필터링 단계용)
+
+    Returns:
+        TARGET_CLASSES 중 해당 클래스 이름, 또는 "" (수집 대상 아님)
+    """
+    base_type = get_base_type_from_bp(bp)
+    return base_type if base_type in VALID_BASE_TYPES else ""
+
+
+def get_vehicle_class_actor(vehicle) -> str:
+    """
+    액터 객체의 수집 클래스 반환 (collect_dataset 단계용)
+
+    Returns:
+        TARGET_CLASSES 중 해당 클래스 이름, 또는 "" (수집 대상 아님)
+    """
+    base_type = get_base_type_from_actor(vehicle)
+    return base_type if base_type in VALID_BASE_TYPES else ""
 
 
 def is_valid_vehicle_bp(bp) -> bool:
     """
-    스폰 단계: 데이터 수집에 적합한 4륜 차량 블루프린트인지 확인
+    스폰 단계: 수집 대상 4륜 차량 블루프린트인지 확인
 
-    제외 대상:
-        - motorcycle / bicycle: base_type 속성으로 정확하게 필터링
-          (기존 키워드 방식은 CARLA 신규 블루프린트 누락 위험)
-        - trailer: 트럭과 별개 액터로 생성되어 동일 트럭이 분할 저장되는 원인
+    수집 대상: car / truck / van / bus (VALID_BASE_TYPES)
+    제외 대상: motorcycle / bicycle / trailer / 기타 base_type
     """
-    base_type = get_base_type_from_bp(bp)
-    if base_type in EXCLUDE_BASE_TYPES:
+    if not get_vehicle_class_bp(bp):
         return False
     if "trailer" in bp.id.lower():
         return False
     return True
 
 
-def is_truck_actor(vehicle) -> bool:
-    """액터 객체로 트럭/대형차 여부 판단 (수집 단계용)"""
-    return get_base_type_from_actor(vehicle) in TRUCK_BASE_TYPES
-
-
 def is_valid_vehicle_actor(vehicle) -> bool:
     """
-    수집 단계: 액터의 base_type 속성으로 이륜차 / trailer 제외
+    수집 단계: 수집 대상 차종 액터인지 확인
 
     base_type 속성이 없는 구버전 CARLA 환경을 위한 fallback 포함
     """
-    base_type = get_base_type_from_actor(vehicle)
-    if base_type in EXCLUDE_BASE_TYPES:
+    if not get_vehicle_class_actor(vehicle):
         return False
     if "trailer" in vehicle.type_id.lower():
         return False
@@ -161,12 +187,13 @@ def is_valid_vehicle_actor(vehicle) -> bool:
 
 
 def setup_output_dirs():
-    """학습 데이터 저장 폴더 생성"""
-    for sub in ["car", "truck"]:
-        os.makedirs(os.path.join(OUTPUT_DIR, sub), exist_ok=True)
+    """학습 데이터 저장 폴더 생성 (TARGET_CLASSES 기준)"""
+    for cls in TARGET_CLASSES:
+        os.makedirs(os.path.join(OUTPUT_DIR, cls), exist_ok=True)
     if SAVE_RAW:
         os.makedirs(RAW_DIR, exist_ok=True)
-    print(f"[DataCollector] 출력 폴더 준비 완료: {OUTPUT_DIR}")
+    print(f"[DataCollector] 출력 폴더 준비 완료: {OUTPUT_DIR}/  "
+          f"({' | '.join(TARGET_CLASSES)})")
 
 
 def connect_to_carla():
@@ -357,51 +384,72 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
     """
     NPC 차량 자동 생성 및 자율주행 활성화
 
-    수정사항:
-        - base_type 속성 기반 필터링으로 교체
-          (키워드 방식은 신규 블루프린트 누락 위험 → base_type이 더 정확)
-        - 승용차:트럭 = 5:5 (1:1) 균등 비율로 변경
-          (7:3 비율은 데이터 불균형을 유발하여 모델 편향 원인)
+    4개 클래스(car / truck / van / bus) 균등 순환 스폰:
+        - TARGET_CLASSES 순서로 round-robin 순환하여 25:25:25:25 비율 목표
+        - 클래스 내 블루프린트를 itertools.cycle로 순환
+          → 동일 모델 연속 스폰 방지 + 모든 차량 모델 균등 수집
     """
     bp_lib = world.get_blueprint_library()
     spawn_points = world.get_map().get_spawn_points()
     random.shuffle(spawn_points)
 
-    # base_type 속성 기반 필터링 (motorcycle / bicycle / trailer 제외)
-    valid_bps = [b for b in bp_lib.filter("vehicle.*") if is_valid_vehicle_bp(b)]
-    truck_bps = [b for b in valid_bps if is_truck_bp(b)]
-    car_bps   = [b for b in valid_bps if not is_truck_bp(b)]
+    # 클래스별 블루프린트 분류 및 셔플 (수집 다양성 확보)
+    class_bps: dict[str, list] = {cls: [] for cls in TARGET_CLASSES}
+    for bp in bp_lib.filter("vehicle.*"):
+        if not is_valid_vehicle_bp(bp):
+            continue
+        cls = get_vehicle_class_bp(bp)
+        if cls in class_bps:
+            class_bps[cls].append(bp)
 
-    print(
-        f"[DataCollector] 유효 블루프린트 — car: {len(car_bps)}종  "
-        f"truck: {len(truck_bps)}종  "
-        f"(motorcycle/bicycle/trailer 제외됨)"
-    )
+    for bps in class_bps.values():
+        random.shuffle(bps)     # 스폰 순서 무작위화
+
+    # 모든 모델이 균등 선택되도록 cycle 이터레이터 생성
+    # → 같은 모델이 연속으로 반복되지 않고 블루프린트 전체를 순환
+    class_iters: dict[str, object] = {
+        cls: itertools.cycle(bps) if bps else None
+        for cls, bps in class_bps.items()
+    }
+
+    bp_summary = "  ".join(f"{cls}: {len(class_bps[cls])}종"
+                           for cls in TARGET_CLASSES)
+    print(f"[DataCollector] 유효 블루프린트 — {bp_summary}  "
+          f"(motorcycle/bicycle/trailer 제외)")
 
     vehicles = []
     tm = client.get_trafficmanager(8000)
     tm.set_global_distance_to_leading_vehicle(2.0)
 
+    # 4개 클래스를 순서대로 순환 스폰 (car→truck→van→bus→car→...)
+    class_cycle = itertools.cycle(TARGET_CLASSES)
     for sp in spawn_points[:num]:
-        # 승용차:트럭 = 5:5 (1:1) — 균형 데이터셋 수집 목적
-        if random.random() < 0.5 and truck_bps:
-            bp = random.choice(truck_bps)
-        elif car_bps:
-            bp = random.choice(car_bps)
-        else:
-            bp = random.choice(valid_bps)
+        target_cls = next(class_cycle)
+        it = class_iters.get(target_cls)
 
+        if it is None:
+            # 해당 클래스 블루프린트 없으면 가용 클래스 중 랜덤 선택
+            available = [c for c in TARGET_CLASSES if class_iters[c] is not None]
+            if not available:
+                continue
+            it = class_iters[random.choice(available)]
+
+        bp = next(it)
         actor = world.try_spawn_actor(bp, sp)
         if actor:
             actor.set_autopilot(True, tm.get_port())
             vehicles.append(actor)
 
-    truck_count = sum(1 for v in vehicles if is_truck_actor(v))
-    car_count   = len(vehicles) - truck_count
-    print(
-        f"[DataCollector] NPC 차량 {len(vehicles)}대 생성 (목표 {num}대) "
-        f"— car: {car_count}대  truck: {truck_count}대"
-    )
+    # 실제 스폰된 클래스별 카운트 집계
+    final_counts: dict[str, int] = {cls: 0 for cls in TARGET_CLASSES}
+    for v in vehicles:
+        cls = get_vehicle_class_actor(v)
+        if cls in final_counts:
+            final_counts[cls] += 1
+
+    count_summary = "  ".join(f"{cls}: {final_counts[cls]}대"
+                              for cls in TARGET_CLASSES)
+    print(f"[DataCollector] NPC {len(vehicles)}대 생성 (목표 {num}대) — {count_summary}")
     return vehicles
 
 
@@ -499,32 +547,36 @@ def world_to_pixel(world_loc, camera_actor, K):
 
 def get_vehicle_bbox_pixels(vehicle, camera_actor, K, img_w, img_h):
     """
-    차량의 3D Bounding Box 8개 꼭짓점을 픽셀에 투영하여
-    2D BBox (x, y, w, h) 반환
-
-    Returns:
-        (x, y, w, h) 또는 None
+    차량의 3D Bounding Box 8개 꼭짓점을 픽셀에 투영하여 2D BBox 반환
+    (화면 밖으로 삐져나간 대형 차량/버스의 꼭짓점 클리핑 문제 해결 버전)
     """
     bbox_3d  = vehicle.bounding_box
     transform = vehicle.get_transform()
-
     verts = bbox_3d.get_world_vertices(transform)
 
-    pixels = []
+    us = []
+    vs = []
+    
     for v in verts:
         px = world_to_pixel(v, camera_actor, K)
+        # 카메라 렌즈 앞(z > 0)에 있는 꼭짓점만 좌표 수집 (화면 밖이어도 수집)
         if px is not None:
-            pu, pv = px
-            if 0 <= pu < img_w and 0 <= pv < img_h:
-                pixels.append((pu, pv))
+            us.append(px[0])
+            vs.append(px[1])
 
-    if len(pixels) < 2:
+    # 카메라 앞에 꼭짓점이 2개 미만이면 박스를 그릴 수 없음
+    if len(us) < 2:
         return None
 
-    us = [p[0] for p in pixels]
-    vs = [p[1] for p in pixels]
-    x1, y1 = max(0, min(us)), max(0, min(vs))
-    x2, y2 = min(img_w - 1, max(us)), min(img_h - 1, max(vs))
+    # 화면 밖 좌표를 포함한 전체 최소/최대 픽셀 좌표 계산
+    x1, y1 = min(us), min(vs)
+    x2, y2 = max(us), max(vs)
+
+    # 이미지 해상도 경계선에 맞춰 BBox를 자름 (Clamp)
+    x1 = max(0, min(x1, img_w - 1))
+    y1 = max(0, min(y1, img_h - 1))
+    x2 = max(0, min(x2, img_w - 1))
+    y2 = max(0, min(y2, img_h - 1))
 
     w = x2 - x1
     h = y2 - y1
@@ -535,24 +587,23 @@ def get_vehicle_bbox_pixels(vehicle, camera_actor, K, img_w, img_h):
     if w > MAX_BBOX_PX or h > MAX_BBOX_PX:
         return None
 
-    return x1, y1, w, h
+    return int(x1), int(y1), int(w), int(h)
 
 
 # =============================================
 # 실시간 디버그 화면 렌더링
 # =============================================
 def draw_debug_overlay(img_bgr, detections, frame_idx,
-                       saved_car, saved_truck, weather_name: str = ""):
+                       saved_counts: dict, weather_name: str = "", map_name: str = ""):
     """
     CARLA 카메라 프레임 위에 Ground Truth BBox + 라벨 + 수집 진행률 오버레이
 
     Args:
-        img_bgr      : 원본 BGR 이미지
-        detections   : [(label, bbox, vehicle_id), ...] 리스트
-        frame_idx    : 현재 프레임 번호
-        saved_car    : 누적 car 저장 수
-        saved_truck  : 누적 truck 저장 수
-        weather_name : 현재 날씨 프리셋 이름 (표시용)
+        img_bgr       : 원본 BGR 이미지
+        detections    : [(label, bbox, vehicle_id), ...] 리스트
+        frame_idx     : 현재 프레임 번호
+        saved_counts  : {"car": n, "truck": n, "van": n, "bus": n} 누적 저장 수
+        weather_name  : 현재 날씨 프리셋 이름 (표시용)
 
     Returns:
         display: 오버레이가 그려진 이미지
@@ -561,7 +612,7 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
 
     for label, bbox, vid in detections:
         x, y, w, h = bbox
-        color = COLOR_CAR if label == "car" else COLOR_TRUCK
+        color = CLASS_COLORS.get(label, CLASS_COLORS["other"])
 
         # BBox 사각형
         cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
@@ -573,50 +624,44 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
         cv2.putText(display, text, (x + 2, y - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-    # ── 상단 정보 패널 (높이 확장: 60 → 95) ──
-    panel_h = 95
+    # ── 상단 정보 패널 (4개 프로그레스 바 수용: 130px) ──
+    panel_h = 130
     overlay = display.copy()
     cv2.rectangle(overlay, (0, 0), (display.shape[1], panel_h), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
 
     # 기본 정보 텍스트 (날씨 이름 포함)
     weather_label = weather_name if weather_name else "-"
-    info = (f"Frame: {frame_idx}  |  Detected: {len(detections)}  |  "
+    map_label = map_name if map_name else "-"
+    info = (f"Map: {map_label}  |  Frame: {frame_idx}  |  Detected: {len(detections)}  |  "
             f"Weather: {weather_label}  |  NPC: {NUM_NPC}  |  [Q] Quit")
-    cv2.putText(display, info, (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(display, info, (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-    # ── 수집 진행률 프로그레스 바 ──
-    bar_w     = 300          # 프로그레스 바 최대 너비
-    bar_h     = 14           # 프로그레스 바 높이
-    bar_x     = 10           # 시작 X
-    bar_y_car   = 45         # Car 바 Y
-    bar_y_truck = 68         # Truck 바 Y
+    # ── 수집 진행률 프로그레스 바 (4개 클래스) ──
+    bar_w  = 250          # 프로그레스 바 최대 너비
+    bar_h  = 16           # 프로그레스 바 높이
+    bar_x  = 10           # 시작 X
+    gap    = 24           # 바 간격 (bar_h + 여백)
+    bar_y0 = 38           # 첫 번째 바 Y 시작
 
-    car_ratio   = min(saved_car   / TARGET_PER_CLASS, 1.0)
-    truck_ratio = min(saved_truck / TARGET_PER_CLASS, 1.0)
+    for i, cls in enumerate(TARGET_CLASSES):
+        count = saved_counts.get(cls, 0)
+        ratio = min(count / TARGET_PER_CLASS, 1.0)
+        color = CLASS_COLORS.get(cls, CLASS_COLORS["other"])
+        bar_y = bar_y0 + i * gap
 
-    # Car 프로그레스 바
-    cv2.rectangle(display, (bar_x, bar_y_car),
-                  (bar_x + bar_w, bar_y_car + bar_h), (60, 60, 60), -1)
-    cv2.rectangle(display, (bar_x, bar_y_car),
-                  (bar_x + int(bar_w * car_ratio), bar_y_car + bar_h),
-                  COLOR_CAR, -1)
-    cv2.putText(display,
-                f"Car  : {saved_car:>5}/{TARGET_PER_CLASS} ({car_ratio*100:5.1f}%)",
-                (bar_x + bar_w + 10, bar_y_car + bar_h - 1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_CAR, 1)
-
-    # Truck 프로그레스 바
-    cv2.rectangle(display, (bar_x, bar_y_truck),
-                  (bar_x + bar_w, bar_y_truck + bar_h), (60, 60, 60), -1)
-    cv2.rectangle(display, (bar_x, bar_y_truck),
-                  (bar_x + int(bar_w * truck_ratio), bar_y_truck + bar_h),
-                  COLOR_TRUCK, -1)
-    cv2.putText(display,
-                f"Truck: {saved_truck:>5}/{TARGET_PER_CLASS} ({truck_ratio*100:5.1f}%)",
-                (bar_x + bar_w + 10, bar_y_truck + bar_h - 1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_TRUCK, 1)
+        # 배경 바
+        cv2.rectangle(display, (bar_x, bar_y),
+                      (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
+        # 진행 바
+        cv2.rectangle(display, (bar_x, bar_y),
+                      (bar_x + int(bar_w * ratio), bar_y + bar_h), color, -1)
+        # 텍스트
+        label_str = f"{cls.capitalize():<5}: {count:>5}/{TARGET_PER_CLASS} ({ratio*100:5.1f}%)"
+        cv2.putText(display, label_str,
+                    (bar_x + bar_w + 10, bar_y + bar_h - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1)
 
     return display
 
@@ -624,7 +669,7 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
 # =============================================
 # 메인 데이터 수집 루프
 # =============================================
-def collect_dataset(world, camera, img_queue, vehicles):
+def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str):
     """
     Ground Truth 기반 차량 이미지 자동 캡처 + 화면 디버그 뷰
 
@@ -632,8 +677,8 @@ def collect_dataset(world, camera, img_queue, vehicles):
         - base_type 속성 기반 이륜차 필터링으로 교체
           (키워드 방식 누락 문제 완전 해결)
         - 클래스별 수집 캡(TARGET_PER_CLASS) 적용
-          → car / truck 각각 목표 수량 도달 시 해당 클래스 캡처 중단
-          → 양쪽 모두 목표 달성 시 시뮬레이션 자동 종료
+          → car / truck / van / bus 각각 목표 수량 도달 시 해당 클래스 캡처 중단
+          → 전 클래스 목표 달성 시 시뮬레이션 자동 종료
         - 날씨 로테이션 추가 (WEATHER_CHANGE_INTERVAL 프레임마다 순환)
           → WEATHER_PRESETS 7가지를 순서대로 적용
           → 단일 환경 과적합 방지 및 데이터 다양성 확보
@@ -643,9 +688,8 @@ def collect_dataset(world, camera, img_queue, vehicles):
     # 차량별 마지막 캡처 시각 (중복 방지)
     last_capture: dict[int, float] = {}
 
-    saved_car   = 0
-    saved_truck = 0
-    frame_idx   = 0
+    saved_counts: dict[str, int] = {cls: 0 for cls in TARGET_CLASSES}
+    frame_idx = 0
 
     # ── 날씨 로테이션 초기화 ──
     weather_idx     = 0
@@ -710,7 +754,9 @@ def collect_dataset(world, camera, img_queue, vehicles):
                 if not is_vehicle_visible(world, cam_loc, vehicle):
                     continue
 
-                label = "truck" if is_truck_actor(vehicle) else "car"
+                label = get_vehicle_class_actor(vehicle)
+                if not label:
+                    continue
 
                 # 3D BBox → 2D 픽셀 BBox
                 bbox = get_vehicle_bbox_pixels(vehicle, camera, K,
@@ -722,9 +768,7 @@ def collect_dataset(world, camera, img_queue, vehicles):
 
                 # ── 클래스 캡(Cap) 체크 ──
                 # 해당 클래스가 목표 수량에 도달하면 더 이상 저장하지 않음
-                if label == "car"   and saved_car   >= TARGET_PER_CLASS:
-                    continue
-                if label == "truck" and saved_truck >= TARGET_PER_CLASS:
+                if saved_counts.get(label, 0) >= TARGET_PER_CLASS:
                     continue
 
                 # 쿨다운 체크 (같은 차량 중복 캡처 방지)
@@ -743,23 +787,20 @@ def collect_dataset(world, camera, img_queue, vehicles):
                 cv2.imwrite(save_path, crop)
                 last_capture[vid] = now
 
-                if label == "car":
-                    saved_car += 1
-                else:
-                    saved_truck += 1
+                saved_counts[label] = saved_counts.get(label, 0) + 1
 
-            # ── 양쪽 클래스 모두 목표 도달 시 자동 종료 ──
-            if saved_car >= TARGET_PER_CLASS and saved_truck >= TARGET_PER_CLASS:
-                print(
-                    f"\n[DataCollector] ✓ 목표 수집량 달성! 자동 종료합니다.\n"
-                    f"  car: {saved_car}장  truck: {saved_truck}장 (목표: {TARGET_PER_CLASS}장)"
-                )
+            # ── 전 클래스 목표 도달 시 자동 종료 ──
+            if all(saved_counts.get(cls, 0) >= TARGET_PER_CLASS for cls in TARGET_CLASSES):
+                count_str = "  ".join(f"{cls}: {saved_counts[cls]}장"
+                                      for cls in TARGET_CLASSES)
+                print(f"\n[DataCollector] ✓ 전 클래스 목표 달성! 자동 종료합니다.\n"
+                      f"  {count_str}  (목표: {TARGET_PER_CLASS}장/클래스)")
                 break
 
             # 디버그 오버레이 화면 표시
             display = draw_debug_overlay(frame_bgr, detections,
-                                         frame_idx, saved_car, saved_truck,
-                                         current_weather)
+                                         frame_idx, saved_counts,
+                                         current_weather, map_name)
             cv2.imshow("CARLA DataCollector - CCTV View", display)
 
             frame_idx += 1
@@ -769,26 +810,25 @@ def collect_dataset(world, camera, img_queue, vehicles):
                 print("[DataCollector] 사용자 종료 요청")
                 break
 
-            # 진행 상황 5초마다 출력
+            # 진행 상황 50프레임마다 출력
             if frame_idx % 50 == 0:
                 elapsed = time.time() - start_time
-                car_pct   = min(saved_car   / TARGET_PER_CLASS * 100, 100)
-                truck_pct = min(saved_truck / TARGET_PER_CLASS * 100, 100)
-                print(
-                    f"[DataCollector] {elapsed:.0f}s | Frame {frame_idx} | "
-                    f"Weather: {current_weather} | "
-                    f"Car: {saved_car}/{TARGET_PER_CLASS} ({car_pct:.1f}%)  "
-                    f"Truck: {saved_truck}/{TARGET_PER_CLASS} ({truck_pct:.1f}%)"
+                count_str = "  ".join(
+                    f"{cls}: {saved_counts.get(cls, 0)}/{TARGET_PER_CLASS} "
+                    f"({min(saved_counts.get(cls, 0) / TARGET_PER_CLASS * 100, 100):.1f}%)"
+                    for cls in TARGET_CLASSES
                 )
+                print(f"[DataCollector] {elapsed:.0f}s | Frame {frame_idx} | "
+                      f"Weather: {current_weather} | {count_str}")
 
     finally:
         cv2.destroyAllWindows()
 
     print(f"\n[DataCollector] 수집 완료!")
-    print(f"  총 프레임  : {frame_idx}")
-    print(f"  저장 car   : {saved_car}장")
-    print(f"  저장 truck : {saved_truck}장")
-    print(f"  저장 경로  : {OUTPUT_DIR}/")
+    print(f"  총 프레임 : {frame_idx}")
+    for cls in TARGET_CLASSES:
+        print(f"  저장 {cls:<5}: {saved_counts.get(cls, 0)}장")
+    print(f"  저장 경로 : {OUTPUT_DIR}/")
 
 
 # =============================================
@@ -796,44 +836,56 @@ def collect_dataset(world, camera, img_queue, vehicles):
 # =============================================
 def main():
     setup_output_dirs()
-    client, world = connect_to_carla()
+    # 맵 로드 시간이 길어질 수 있으므로 타임아웃을 20초로 설정합니다.
+    client = carla.Client(CARLA_HOST, CARLA_PORT)
+    client.set_timeout(20.0) 
 
-    # 동기 모드 설정 (tick() 제어를 위해 권장)
-    settings = world.get_settings()
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = 0.05   # 20 FPS
-    world.apply_settings(settings)
+    # 맵이 바뀌어도 유지되는 전역 카운트 변수
+    global_saved_counts = {cls: 0 for cls in TARGET_CLASSES}
+    for map_name in MAP_LIST:
+        print(f"\n[DataCollector] === 맵 로드 중: {map_name} ===")
+        world = client.load_world(map_name)
 
-    intersection_loc = find_intersection(world)
-    camera, img_queue = spawn_cctv_camera(world, intersection_loc)
-
-    # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
-    # (기존 단일 랜덤 선택 제거 → 다양성 자동 확보)
-
-    vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
-
-    # 배경 워밍업 (차량들이 이동을 시작하도록 대기)
-    print("[DataCollector] 배경 워밍업 중...")
-    for _ in range(50):
-        world.tick()
-        try:
-            img_queue.get_nowait()
-        except queue.Empty:
-            pass
-
-    try:
-        collect_dataset(world, camera, img_queue, vehicles)
-    finally:
-        # 동기 모드 해제
-        settings.synchronous_mode = False
+        # 동기 모드 설정 (tick() 제어를 위해 권장)
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05   # 20 FPS
         world.apply_settings(settings)
 
-        print("[DataCollector] 정리 중...")
-        camera.stop()
-        camera.destroy()
-        for v in vehicles:
-            v.destroy()
-        print("[DataCollector] 종료 완료")
+        intersection_loc = find_intersection(world)
+        camera, img_queue = spawn_cctv_camera(world, intersection_loc)
+
+        # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
+        # (기존 단일 랜덤 선택 제거 → 다양성 자동 확보)
+
+        vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
+
+        # 배경 워밍업 (차량들이 이동을 시작하도록 대기)
+        print("[DataCollector] 배경 워밍업 중...")
+        for _ in range(50):
+            world.tick()
+            try:
+                img_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        try:
+            collect_dataset(world, camera, img_queue, global_saved_counts, map_name)
+        finally:
+            # 동기 모드 해제
+            settings.synchronous_mode = False
+            world.apply_settings(settings)
+
+            print(f"[DataCollector] {map_name} 에셋 정리 중...")
+            camera.stop()
+            camera.destroy()
+            for v in vehicles:
+                v.destroy()
+            
+            if all(global_saved_counts.get(cls, 0) >= TARGET_PER_CLASS for cls in TARGET_CLASSES):
+                print("[DataCollector] 모든 목표 수량 달성 완료. 전체 수집을 종료합니다.")
+                break
+            
 
 
 if __name__ == "__main__":
