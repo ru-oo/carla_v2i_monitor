@@ -36,13 +36,17 @@ import math
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
 
-# --- CCTV 카메라 설정 (교차로 남서 코너 건물 상단 CCTV) ---
-# 이미지 참고: 남서쪽 건물 상단에서 북동 방향으로 교차로 전체를 내려다보는 구도
+# --- CCTV 카메라 설정 (교차로 남서 코너 상공 CCTV) ---
+# 이미지 참고: 남서쪽 상공에서 북동 방향으로 교차로 전체를 내려다보는 구도
 # - 왼쪽: 미술관/쇼핑 건물, 오른쪽: 나무/주거 건물, 중앙: 교차로 격자
-CAMERA_HEIGHT    = 18.0         # 건물 상단 레벨 높이 (m)
-CAMERA_PITCH     = -45.0        # 교차로를 가로지르는 급경사 하향각
-CAMERA_OFFSET_X  = -15.0        # 서쪽 오프셋 (남서 코너, CARLA x축 동향)
-CAMERA_OFFSET_Y  = 15.0         # 남쪽 오프셋 (남서 코너, CARLA y축 남향)
+#
+# 높이 28m: Town10HD 최고 건물(25m)보다 높아 건물 내부 스폰 방지
+# 수평 오프셋 (-20, +20) → 대각 거리 ≈ 28m = 높이
+# → arctan(28/28) = 45° : pitch -45° 와 정확히 일치
+CAMERA_HEIGHT    = 28.0         # 건물 최상단 위 (Town10 기준 25m+ 건물 회피)
+CAMERA_PITCH     = -45.0        # 수평거리 == 높이 → 정확한 45° 하향각
+CAMERA_OFFSET_X  = -20.0        # 서쪽 오프셋 (남서 코너, CARLA x축 동향)
+CAMERA_OFFSET_Y  = 20.0         # 남쪽 오프셋 (남서 코너, CARLA y축 남향)
 CAMERA_YAW       = -45.0        # 북동 방향으로 교차로 중심을 향함
 
 IMG_WIDTH     = 1280
@@ -155,9 +159,10 @@ def spawn_cctv_camera(world, intersection_loc):
     교차로 코너에 실제 CCTV처럼 카메라 설치
 
     배치 방식:
-        - 교차로 중심에서 남서쪽 코너(-X, +Y)로 오프셋
-        - 높이 18m (건물 상단 CCTV 기준)
-        - pitch -45° 교차로 전체를 가로지르는 급경사 하향
+        - 교차로 중심에서 남서쪽 상공(-X, +Y, +Z)으로 오프셋
+        - 높이 28m : Town10 최고층 건물 위 → 건물 내부 스폰 방지
+        - 수평 오프셋 (-20, +20) → 대각 거리 ≈ 28m = 높이
+          arctan(28/28) = 45° → pitch -45° 와 완벽히 일치
         - yaw -45° 로 교차로 중심(북동 방향) 향함
 
     Returns:
@@ -180,6 +185,12 @@ def spawn_cctv_camera(world, intersection_loc):
 
     img_queue = queue.Queue(maxsize=5)
     camera = world.spawn_actor(cam_bp, cam_transform)
+    if camera is None:
+        raise RuntimeError(
+            f"[DataCollector] 카메라 스폰 실패 — 위치: "
+            f"({cam_transform.location.x:.1f}, {cam_transform.location.y:.1f}, "
+            f"{cam_transform.location.z:.1f})"
+        )
     camera.listen(lambda img: img_queue.put(img) if not img_queue.full() else None)
 
     cctv_x = intersection_loc.x + CAMERA_OFFSET_X
