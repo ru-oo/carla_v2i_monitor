@@ -490,7 +490,6 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
             tm.auto_lane_change(actor, False)              # 자동 차선변경 비활성 (역주행 방지)
             tm.distance_to_leading_vehicle(actor, random.uniform(2.0, 4.0))
             tm.vehicle_percentage_speed_difference(actor, random.uniform(-10, 10))
-            tm.keep_right_rule_percentage(actor, 80)       # 80% 확률로 우측 차선 유지
             tm.ignore_lights_percentage(actor, 0)          # 신호등 완전 준수 (역주행·교차로 충돌 방지)
             tm.random_left_lanechange_percentage(actor, 5) # 5%만 허용 (거의 차선변경 안 함)
             tm.random_right_lanechange_percentage(actor, 5)
