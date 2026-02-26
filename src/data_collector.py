@@ -134,25 +134,44 @@ def connect_to_carla():
 # =============================================
 def find_intersection(world):
     """
-    맵에서 교통량이 많은 교차로 위치 자동 탐색
-    (spawn_points 중 밀집도가 높은 중심점 사용)
+    맵에서 실제 도로 교차로(junction) 위치 탐색
+
+    CARLA waypoint API의 is_junction 플래그를 사용해
+    spawn_point 평균(건물/공원으로 빠질 수 있음) 대신
+    실제 도로 위 junction 중심을 반환한다.
+
+    선택 기준: 맵 전체 junction 평균 위치에 가장 가까운 junction
+              → 도심 중앙의 대표 교차로
     """
-    spawn_points = world.get_map().get_spawn_points()
-    if not spawn_points:
-        return carla.Location(x=0, y=0, z=0)
+    carla_map = world.get_map()
 
-    # 모든 spawn point의 평균 위치 → 교차로 중심 추정
-    xs = [sp.location.x for sp in spawn_points]
-    ys = [sp.location.y for sp in spawn_points]
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
+    # 5m 간격 waypoint 생성 후 junction 필터링
+    all_wps = carla_map.generate_waypoints(5.0)
+    junction_wps = [wp for wp in all_wps if wp.is_junction]
 
-    # 평균 위치에 가장 가까운 spawn point 선택
-    best = min(spawn_points,
-               key=lambda sp: (sp.location.x - cx)**2 + (sp.location.y - cy)**2)
-    loc = best.location
-    print(f"[DataCollector] 교차로 위치 탐색 완료: ({loc.x:.1f}, {loc.y:.1f})")
-    return loc
+    if not junction_wps:
+        # fallback: spawn point 평균
+        print("[DataCollector] 경고: junction 없음 → spawn point 평균 사용")
+        sps = carla_map.get_spawn_points()
+        xs = [sp.location.x for sp in sps]
+        ys = [sp.location.y for sp in sps]
+        return carla.Location(x=sum(xs) / len(xs), y=sum(ys) / len(ys), z=0.0)
+
+    # 모든 junction waypoint의 평균 위치 계산 (도심 중앙 기준점)
+    cx = sum(wp.transform.location.x for wp in junction_wps) / len(junction_wps)
+    cy = sum(wp.transform.location.y for wp in junction_wps) / len(junction_wps)
+
+    # 평균 위치에 가장 가까운 junction waypoint 선택
+    best_wp = min(
+        junction_wps,
+        key=lambda wp: (wp.transform.location.x - cx) ** 2
+                     + (wp.transform.location.y - cy) ** 2,
+    )
+    loc = best_wp.transform.location
+    print(f"[DataCollector] 도로 junction 탐색 완료: "
+          f"({loc.x:.1f}, {loc.y:.1f}, z={loc.z:.1f})  "
+          f"(전체 junction wp {len(junction_wps)}개 중 선택)")
+    return carla.Location(x=loc.x, y=loc.y, z=loc.z)
 
 
 def spawn_cctv_camera(world, intersection_loc):
@@ -397,7 +416,7 @@ def draw_debug_overlay(img_bgr, detections, frame_idx, saved_car, saved_truck):
     info = (f"Frame: {frame_idx}  |  "
             f"Detected: {len(detections)}  |  "
             f"Saved - Car: {saved_car}  Truck: {saved_truck}  |  "
-            f"NPC: {NUM_NPC}대  |  [Q] Quit")
+            f"NPC: {NUM_NPC}  |  [Q] Quit")
     cv2.putText(display, info, (10, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
