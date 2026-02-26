@@ -49,8 +49,8 @@ CAMERA_HEIGHT    = 6.0          # 실제 신호등 CCTV 폴 높이 (m)
 # pitch / yaw / offset 은 spawn_cctv_camera() 에서 동적 계산
 MAX_VEHICLE_DIST = 60.0         # 이 거리(m) 초과 차량은 수집 제외 (너무 작아 품질 저하)
 
-IMG_WIDTH     = 1920
-IMG_HEIGHT    = 1080
+IMG_WIDTH     = 1280
+IMG_HEIGHT    = 720
 FOV           = 90.0            # 85 → 90 (교차로 전체가 시야에 들어오도록)
 
 OUTPUT_DIR    = "data/vehicle_images"
@@ -464,7 +464,8 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
 
     vehicles = []
     tm = client.get_trafficmanager(8000)
-    tm.set_global_distance_to_leading_vehicle(1.5)   # 2.0 → 1.5 (차간 간격 줄여 연쇄 정체 완화)
+    # 전역 차간 거리 2.5m — 너무 좁으면 추돌·정체 연쇄 발생
+    tm.set_global_distance_to_leading_vehicle(2.5)
 
     # 4개 클래스를 순서대로 순환 스폰 (car→truck→van→bus→car→...)
     class_cycle = itertools.cycle(TARGET_CLASSES)
@@ -483,15 +484,15 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
         actor = world.try_spawn_actor(bp, sp)
         if actor:
             actor.set_autopilot(True, tm.get_port())
-            # ── 차량별 TM 파라미터 다양화 → 정체·충돌·멈춤 현상 완화 ──
-            tm.auto_lane_change(actor, True)
-            tm.distance_to_leading_vehicle(actor, random.uniform(1.0, 3.0))
+            # ── TM 파라미터: 도로 준수 우선, 최소한의 다양성만 부여 ──
+            # ignore_lights / 공격적 차선변경은 맵에 따라 차들을 보도·역주행으로 유도하므로 제거
+            tm.auto_lane_change(actor, False)              # 자동 차선변경 비활성 (역주행 방지)
+            tm.distance_to_leading_vehicle(actor, random.uniform(2.0, 4.0))
             tm.vehicle_percentage_speed_difference(actor, random.uniform(-10, 10))
-            # 신호등 일부 무시 → 신호 대기로 교차로가 꽉 막히는 현상 완화
-            tm.ignore_lights_percentage(actor, 30)
-            # 적극적 차선 변경 → 앞차에 막혀 정체될 때 우회 유도
-            tm.random_left_lanechange_percentage(actor, 40)
-            tm.random_right_lanechange_percentage(actor, 40)
+            tm.keep_right_rule_percentage(actor, 80)       # 80% 확률로 우측 차선 유지
+            tm.ignore_lights_percentage(actor, 0)          # 신호등 완전 준수 (역주행·교차로 충돌 방지)
+            tm.random_left_lanechange_percentage(actor, 5) # 5%만 허용 (거의 차선변경 안 함)
+            tm.random_right_lanechange_percentage(actor, 5)
             vehicles.append(actor)
 
     # 실제 스폰된 클래스별 카운트 집계
@@ -753,6 +754,11 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str,
     # ── Stuck 차량 카운터: vid -> 연속 정지 횟수 ──
     stuck_counts: dict[int, int] = {}
 
+    # ── actor_list 캐시 (3프레임마다 갱신) ──
+    # get_actors()는 CARLA 서버 RPC 호출로 비용이 있음 → 매 프레임 호출 대신 캐싱
+    actor_list_cache: list = []
+    ACTOR_CACHE_INTERVAL = 3
+
     # ★ saved_counts는 main()에서 넘어온 global_saved_counts 참조 —
     #   절대 새 dict로 재초기화하지 말 것 (맵 간 누적 카운트 파괴됨)
     frame_idx = 0
@@ -764,7 +770,7 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str,
     set_weather(world, current_weather)   # 첫 번째 날씨 즉시 적용
 
     cv2.namedWindow("CARLA DataCollector - CCTV View", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("CARLA DataCollector - CCTV View", 1920, 1080)
+    cv2.resizeWindow("CARLA DataCollector - CCTV View", 1280, 720)
 
     progress_str = "  ".join(
         f"{cls}: {saved_counts.get(cls, 0)}/{TARGET_PER_CLASS}"
@@ -855,8 +861,10 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str,
                     new_vehicles = spawn_npc_vehicles(client, world, num=need)
                     vehicles[:] = live + new_vehicles
 
-            # 현재 월드의 모든 차량 가져오기
-            actor_list = world.get_actors().filter("vehicle.*")
+            # 현재 월드의 모든 차량 가져오기 (3프레임마다 갱신)
+            if frame_idx % ACTOR_CACHE_INTERVAL == 0:
+                actor_list_cache = list(world.get_actors().filter("vehicle.*"))
+            actor_list = actor_list_cache
             now = time.time()
 
             detections = []
@@ -1040,15 +1048,26 @@ def main():
             world.apply_settings(settings)
             tm.set_synchronous_mode(True)
 
+            # ── TM 사전 워밍업 (차량 스폰 전) ──
+            # 맵 전환 직후 TM이 새 맵의 도로 토폴로지를 완전히 인식하기 전에
+            # 차량을 스폰하면 TM이 이전 맵 기준으로 경로를 계산해 보도·역주행 발생.
+            # 동기 모드 tick을 30회 진행해 TM이 새 도로 정보를 로드하도록 보장.
+            print("[DataCollector] TM 도로 토폴로지 초기화 중...")
+            for _ in range(30):
+                try:
+                    world.tick()
+                except Exception:
+                    pass
+
             intersection_loc = find_intersection(world)
             camera, img_queue = spawn_cctv_camera(world, intersection_loc)
 
             # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
             vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
 
-            # 배경 워밍업 (차량들이 이동을 시작하도록 대기)
+            # 배경 워밍업 (차량들이 올바른 차선에 안착하도록 충분히 대기)
             print("[DataCollector] 배경 워밍업 중...")
-            for _ in range(80):   # 50 → 80 tick (안정화 시간 확보)
+            for _ in range(100):   # 80 → 100 tick (도로 정착 시간 확보)
                 try:
                     world.tick()
                 except Exception:
