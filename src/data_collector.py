@@ -37,16 +37,18 @@ import math
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
 
-# --- CCTV 카메라 설정 (교차로 코너 실제 CCTV 위치) ---
-CAMERA_HEIGHT    = 7.0          # 실제 교차로 신호등 CCTV 높이 (m)
-CAMERA_PITCH     = -40.0        # 비스듬히 교차로를 내려다보는 각도
-CAMERA_OFFSET_X  = 12.0         # 교차로 중심에서 동쪽 코너 오프셋 (m)
-CAMERA_OFFSET_Y  = -12.0        # 교차로 중심에서 북쪽 코너 오프셋 (m, CARLA y축 남향)
-CAMERA_YAW       = -135.0       # 교차로 중심(남서)을 향하는 yaw 각도
+# --- CCTV 카메라 설정 (교차로 남서 코너 건물 상단 CCTV) ---
+# 이미지 참고: 남서쪽 건물 상단에서 북동 방향으로 교차로 전체를 내려다보는 구도
+# - 왼쪽: 미술관/쇼핑 건물, 오른쪽: 나무/주거 건물, 중앙: 교차로 격자
+CAMERA_HEIGHT    = 18.0         # 건물 상단 레벨 높이 (m)
+CAMERA_PITCH     = -45.0        # 교차로를 가로지르는 급경사 하향각
+CAMERA_OFFSET_X  = -15.0        # 서쪽 오프셋 (남서 코너, CARLA x축 동향)
+CAMERA_OFFSET_Y  = 15.0         # 남쪽 오프셋 (남서 코너, CARLA y축 남향)
+CAMERA_YAW       = -45.0        # 북동 방향으로 교차로 중심을 향함
 
 IMG_WIDTH     = 1280
 IMG_HEIGHT    = 720
-FOV           = 85.0            # 90 → 85 (CCTV 렌즈 화각)
+FOV           = 90.0            # 85 → 90 (교차로 전체가 시야에 들어오도록)
 
 OUTPUT_DIR    = "data/vehicle_images"
 RAW_DIR       = "data/raw"
@@ -154,10 +156,10 @@ def spawn_cctv_camera(world, intersection_loc):
     교차로 코너에 실제 CCTV처럼 카메라 설치
 
     배치 방식:
-        - 교차로 중심에서 동북쪽 코너(+X, -Y)로 오프셋
-        - 높이 7m (신호등 CCTV 기준)
-        - pitch -40° 비스듬히 교차로 전체를 내려다봄
-        - yaw -135° 로 교차로 중심(남서 방향) 향함
+        - 교차로 중심에서 남서쪽 코너(-X, +Y)로 오프셋
+        - 높이 18m (건물 상단 CCTV 기준)
+        - pitch -45° 교차로 전체를 가로지르는 급경사 하향
+        - yaw -45° 로 교차로 중심(북동 방향) 향함
 
     Returns:
         camera_sensor, image_queue
