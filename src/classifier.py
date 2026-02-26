@@ -6,119 +6,138 @@ classifier.py
 
 역할:
     - 경량 CNN 모델 설계 및 학습 (PyTorch)
-    - 차종 이진 분류: 승용차(car) vs 트럭(truck)
+    - 차종 4클래스 분류: bus / car / truck / van
     - 학습된 모델 저장 및 추론 인터페이스 제공
     - main_system.py에서 호출하는 classify() 함수 구현
 
 산출물:
     - models/classifier.pth (학습된 가중치 - gitignore 처리됨)
-    - classify(image_crop) → "car" | "truck" 반환
+    - classify(image_crop) → "bus" | "car" | "truck" | "van" 반환
 """
 
 import os
+import random
+import time
+from collections import Counter
+
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from PIL import Image
-import numpy as np
-import cv2
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torchvision import transforms
+
+# =============================================
+# 경로 설정 (스크립트 위치 기준 — CWD 무관)
+# =============================================
+_SRC_DIR   = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR   = os.path.dirname(_SRC_DIR)
+DATA_DIR   = os.path.join(BASE_DIR, "data", "vehicle_images")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "classifier.pth")
 
 # =============================================
 # 설정값 (Config)
 # =============================================
-MODEL_PATH = "models/classifier.pth"
-DATA_DIR = "data/vehicle_images"
-IMG_SIZE = 64          # CNN 입력 이미지 크기
-BATCH_SIZE = 32
-EPOCHS = 20
-LEARNING_RATE = 0.001
-CLASSES = ["car", "truck"]  # 0: car, 1: truck
+IMG_SIZE      = 64          # CNN 입력 크기 (CPU 친화적)
+BATCH_SIZE    = 64
+EPOCHS        = 30
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-4
+PATIENCE      = 7           # Early-stopping patience
+
+CLASSES     = ["bus", "car", "truck", "van"]   # 4클래스
+NUM_CLASSES = len(CLASSES)
 
 
 # =============================================
-# 경량 CNN 모델 정의
+# CNN 모델 정의 (4-Block + GlobalAvgPool)
 # =============================================
 class VehicleCNN(nn.Module):
     """
-    승용차 / 트럭 이진 분류용 경량 CNN
+    4클래스 차종 분류 CNN
 
-    입력: (B, 3, 64, 64) RGB 이미지
-    출력: (B, 2) 클래스 로짓
+    아키텍처:
+        Block 1~4: Conv 3×3 (×2) + BN + ReLU + MaxPool2×2
+        GAP (Global Average Pooling) → 파라미터 절감
+        FC: 256 → 128 → NUM_CLASSES
+
+    입력: (B, 3, 64, 64)
+    출력: (B, NUM_CLASSES)
     """
 
-    def __init__(self):
-        super(VehicleCNN, self).__init__()
+    def __init__(self, num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2, 2),        # 해상도 ÷2
+                nn.Dropout2d(0.1),
+            )
 
         self.features = nn.Sequential(
-            # Block 1: 3 → 32 채널
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),   # 64 → 32
-
-            # Block 2: 32 → 64 채널
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),   # 32 → 16
-
-            # Block 3: 64 → 128 채널
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),   # 16 → 8
+            _conv_block(3,    32),    # 64 → 32
+            _conv_block(32,   64),    # 32 → 16
+            _conv_block(64,  128),    # 16 →  8
+            _conv_block(128, 256),    #  8 →  4
         )
 
-        self.classifier = nn.Sequential(
+        # Global Average Pooling: (B, 256, 4, 4) → (B, 256)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(128 * 8 * 8, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, len(CLASSES)),
+            nn.Linear(128, num_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = x.view(x.size(0), -1)   # Flatten
-        x = self.classifier(x)
+        x = self.gap(x)
+        x = self.head(x)
         return x
 
 
 # =============================================
 # 데이터셋 클래스
 # =============================================
-class VehicleDataset(Dataset):
+def _load_all_samples(root_dir: str) -> list[tuple[str, int]]:
     """
-    data/vehicle_images/ 폴더 구조에서 이미지 로드
-    폴더 구조:
-        data/vehicle_images/
-            car/    ← 승용차 이미지들
-            truck/  ← 트럭 이미지들
+    root_dir 아래 CLASSES 폴더를 스캔해
+    (절대경로, label_idx) 리스트 반환
     """
+    samples: list[tuple[str, int]] = []
+    for label_idx, class_name in enumerate(CLASSES):
+        class_dir = os.path.join(root_dir, class_name)
+        if not os.path.isdir(class_dir):
+            print(f"[Dataset] 경고: {class_dir} 없음 — 스킵")
+            continue
+        for fn in sorted(os.listdir(class_dir)):
+            if fn.lower().endswith((".jpg", ".png", ".jpeg")):
+                samples.append((os.path.join(class_dir, fn), label_idx))
+    return samples
 
-    def __init__(self, root_dir: str, transform=None):
-        self.samples = []
+
+class VehicleDataset(Dataset):
+    """(path, label) 리스트를 받아 이미지를 반환하는 Dataset"""
+
+    def __init__(self, samples: list[tuple[str, int]], transform=None):
+        self.samples   = samples
         self.transform = transform
 
-        for label_idx, class_name in enumerate(CLASSES):
-            class_dir = os.path.join(root_dir, class_name)
-            if not os.path.exists(class_dir):
-                print(f"[Dataset] 경고: {class_dir} 폴더가 없습니다.")
-                continue
-            for filename in os.listdir(class_dir):
-                if filename.lower().endswith((".jpg", ".png", ".jpeg")):
-                    self.samples.append(
-                        (os.path.join(class_dir, filename), label_idx)
-                    )
-
-        print(f"[Dataset] 총 {len(self.samples)}개 샘플 로드")
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         img_path, label = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
         if self.transform:
@@ -127,92 +146,197 @@ class VehicleDataset(Dataset):
 
 
 # =============================================
-# 학습 파이프라인
+# Stratified 분할 (클래스별 8:2)
+# =============================================
+def _stratified_split(
+    samples: list[tuple[str, int]],
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> tuple[list, list]:
+    """
+    각 클래스에서 독립적으로 val_ratio 비율을 검증셋으로 분리.
+    Train/Val 간 transform 오염 없이 별도 Dataset 인스턴스로 분리.
+    """
+    rng = random.Random(seed)
+    per_class: dict[int, list] = {}
+    for path, label in samples:
+        per_class.setdefault(label, []).append((path, label))
+
+    train_s, val_s = [], []
+    for label in sorted(per_class.keys()):
+        items = per_class[label][:]
+        rng.shuffle(items)
+        n_val = max(1, int(len(items) * val_ratio))
+        val_s.extend(items[:n_val])
+        train_s.extend(items[n_val:])
+
+    return train_s, val_s
+
+
+# =============================================
+# 전처리 변환
 # =============================================
 def get_transforms():
-    """학습/추론용 전처리 변환 정의"""
-    train_transform = transforms.Compose([
+    """Train / Val 전처리 변환 반환"""
+    _MEAN = [0.485, 0.456, 0.406]
+    _STD  = [0.229, 0.224, 0.225]
+
+    train_tf = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(_MEAN, _STD),
     ])
-    val_transform = transforms.Compose([
+    val_tf = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(_MEAN, _STD),
     ])
-    return train_transform, val_transform
+    return train_tf, val_tf
 
 
-def train_model():
-    """CNN 모델 학습 및 가중치 저장"""
+# =============================================
+# 학습 파이프라인
+# =============================================
+def train_model() -> float:
+    """
+    CNN 모델 학습, 최고 Val Accuracy 모델 저장,
+    최종 Confusion Matrix 출력 후 best_val_acc 반환.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Classifier] 학습 시작 - Device: {device}")
+    print(f"\n{'='*60}")
+    print(f"[Classifier] 학습 시작  Device={device}  IMG={IMG_SIZE}  Epochs={EPOCHS}")
+    print(f"{'='*60}")
 
-    train_transform, val_transform = get_transforms()
-    dataset = VehicleDataset(DATA_DIR, transform=train_transform)
+    # ---- 데이터 로드 및 분할 ----
+    all_samples = _load_all_samples(DATA_DIR)
+    if not all_samples:
+        raise RuntimeError(f"이미지를 찾을 수 없습니다: {DATA_DIR}")
 
-    # 학습/검증 분할 (8:2)
-    val_size = int(0.2 * len(dataset))
-    train_size = len(dataset) - val_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
-    val_set.dataset.transform = val_transform
+    train_samples, val_samples = _stratified_split(all_samples)
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+    # 분포 출력
+    train_cnt = Counter(s[1] for s in train_samples)
+    val_cnt   = Counter(s[1] for s in val_samples)
+    print("[Dataset] 클래스별 샘플 수:")
+    for i, cn in enumerate(CLASSES):
+        print(f"  {cn:<6}: train={train_cnt[i]:4d}, val={val_cnt[i]:4d}")
+    print(f"  합계 : train={len(train_samples)},  val={len(val_samples)}")
 
-    model = VehicleCNN().to(device)
+    # ---- DataLoader (train: WeightedSampler, val: 순서 고정) ----
+    train_tf, val_tf = get_transforms()
+    train_set = VehicleDataset(train_samples, train_tf)
+    val_set   = VehicleDataset(val_samples,   val_tf)
+
+    # 클래스 불균형 보정 — WeightedRandomSampler
+    class_counts  = [max(train_cnt[i], 1) for i in range(NUM_CLASSES)]
+    class_w       = [1.0 / c for c in class_counts]
+    sample_w      = [class_w[s[1]] for s in train_samples]
+    sampler       = WeightedRandomSampler(sample_w, len(train_samples), replacement=True)
+
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, sampler=sampler,
+                              num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=False)
+
+    # ---- 모델 / 옵티마이저 ----
+    model     = VehicleCNN(NUM_CLASSES).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
-    best_val_acc = 0.0
+    best_val_acc   = 0.0
+    patience_count = 0
+    t0             = time.time()
 
-    for epoch in range(EPOCHS):
-        # 학습
+    print(f"\n{'Ep':>4}  {'Loss':>7}  {'ValAcc':>7}  "
+          + "  ".join(f"{c:>6}" for c in CLASSES)
+          + "  Time")
+    print("-" * 70)
+
+    for epoch in range(1, EPOCHS + 1):
+        # ---- 학습 ----
         model.train()
         running_loss = 0.0
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss = criterion(model(images), labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
+        scheduler.step()
 
-        # 검증
+        # ---- 검증 ----
         model.eval()
-        correct = total = 0
+        cls_correct = [0] * NUM_CLASSES
+        cls_total   = [0] * NUM_CLASSES
         with torch.no_grad():
             for images, labels in val_loader:
                 images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                preds = model(images).argmax(dim=1)
+                for c in range(NUM_CLASSES):
+                    mask = (labels == c)
+                    cls_correct[c] += (preds[mask] == c).sum().item()
+                    cls_total[c]   += mask.sum().item()
 
-        val_acc = correct / total
-        scheduler.step()
-
-        print(
-            f"[Classifier] Epoch {epoch+1}/{EPOCHS} | "
-            f"Loss: {running_loss/len(train_loader):.4f} | "
-            f"Val Acc: {val_acc:.4f}"
+        val_acc  = sum(cls_correct) / max(sum(cls_total), 1)
+        per_cls  = "  ".join(
+            f"{cls_correct[c]/max(cls_total[c],1):6.3f}"
+            for c in range(NUM_CLASSES)
         )
+        elapsed  = (time.time() - t0) / 60
+        mark     = " ★" if val_acc > best_val_acc else ""
+        print(f"{epoch:4d}  {running_loss/len(train_loader):7.4f}  "
+              f"{val_acc:7.4f}  {per_cls}  {elapsed:4.1f}m{mark}")
 
-        # 최고 성능 모델 저장
         if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            os.makedirs("models", exist_ok=True)
+            best_val_acc   = val_acc
+            patience_count = 0
+            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
             torch.save(model.state_dict(), MODEL_PATH)
-            print(f"[Classifier] 모델 저장 완료: {MODEL_PATH} (Acc: {val_acc:.4f})")
+        else:
+            patience_count += 1
+            if patience_count >= PATIENCE:
+                print(f"\n[EarlyStopping] {PATIENCE} 에폭 개선 없음 — 학습 조기 종료")
+                break
 
-    print(f"[Classifier] 학습 완료. 최고 검증 정확도: {best_val_acc:.4f}")
+    # ---- Confusion Matrix ----
+    print(f"\n{'='*60}")
+    print(f"[Classifier] 학습 완료  Best Val Acc: {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
+    print(f"{'='*60}")
+
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+    confusion = [[0] * NUM_CLASSES for _ in range(NUM_CLASSES)]
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            preds = model(images).argmax(dim=1)
+            for t, p in zip(labels.tolist(), preds.tolist()):
+                confusion[t][p] += 1
+
+    print("\n[Confusion Matrix]  행=실제, 열=예측")
+    header = "       " + "  ".join(f"{c:>6}" for c in CLASSES)
+    print(header)
+    print("       " + "  ".join(["------"] * NUM_CLASSES))
+    for i in range(NUM_CLASSES):
+        row_str = "  ".join(f"{confusion[i][c]:6d}" for c in range(NUM_CLASSES))
+        print(f"{CLASSES[i]:>6} | {row_str}")
+
+    print(f"\n클래스별 정밀도 (Precision):")
+    for c in range(NUM_CLASSES):
+        col_sum = sum(confusion[r][c] for r in range(NUM_CLASSES))
+        prec = confusion[c][c] / max(col_sum, 1)
+        rec  = confusion[c][c] / max(sum(confusion[c]), 1)
+        f1   = 2 * prec * rec / max(prec + rec, 1e-9)
+        print(f"  {CLASSES[c]:<6}: Precision={prec:.3f}  Recall={rec:.3f}  F1={f1:.3f}")
+
+    print(f"\n최종 Val Accuracy : {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
+    print(f"모델 저장 위치     : {MODEL_PATH}")
+    return best_val_acc
 
 
 # =============================================
@@ -220,23 +344,23 @@ def train_model():
 # =============================================
 class VehicleClassifier:
     """
-    학습된 CNN 모델을 로드하고 추론을 수행하는 클래스
+    학습된 CNN 모델을 로드하고 추론을 수행하는 클래스.
     main_system.py에서 인스턴스화하여 사용합니다.
     """
 
     def __init__(self, model_path: str = MODEL_PATH):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = VehicleCNN().to(self.device)
+        self.model  = VehicleCNN(NUM_CLASSES).to(self.device)
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((IMG_SIZE, IMG_SIZE)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
+            transforms.Normalize([0.485, 0.456, 0.406],
+                                 [0.229, 0.224, 0.225]),
         ])
         self._load_model(model_path)
 
-    def _load_model(self, model_path: str):
+    def _load_model(self, model_path: str) -> None:
         if not os.path.exists(model_path):
             raise FileNotFoundError(
                 f"모델 파일 없음: {model_path}\n"
@@ -248,29 +372,26 @@ class VehicleClassifier:
 
     def classify(self, image_crop: np.ndarray) -> str:
         """
-        차량 크롭 이미지를 받아 차종 반환
-        (vision_processor.py의 DetectedObject.bbox 기반 크롭 이미지를 입력)
+        차량 크롭 이미지(BGR numpy)를 받아 차종 문자열 반환.
 
         Args:
             image_crop: BGR numpy 배열 (차량 영역 크롭)
 
         Returns:
-            "car" 또는 "truck"
+            "bus" | "car" | "truck" | "van"
         """
         if image_crop is None or image_crop.size == 0:
-            return "car"  # 기본값
+            return "car"   # 기본값
 
-        # BGR → RGB 변환 후 전처리
-        rgb_crop = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
-        tensor = self.transform(rgb_crop).unsqueeze(0).to(self.device)
-
+        rgb = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
+        tensor = self.transform(rgb).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            outputs = self.model(tensor)
-            _, predicted = torch.max(outputs, 1)
-
-        return CLASSES[predicted.item()]
+            pred_idx = self.model(tensor).argmax(dim=1).item()
+        return CLASSES[pred_idx]
 
 
+# =============================================
+# 단독 실행 시 학습 모드
+# =============================================
 if __name__ == "__main__":
-    # 단독 실행 시 학습 모드
     train_model()
