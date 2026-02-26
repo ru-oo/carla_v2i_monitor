@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 import queue
 import math
+import traceback   # 예외 전체 스택 트레이스 출력 (원인 진단용)
 
 # =============================================
 # 설정값 (Config)
@@ -48,8 +49,8 @@ CAMERA_HEIGHT    = 6.0          # 실제 신호등 CCTV 폴 높이 (m)
 # pitch / yaw / offset 은 spawn_cctv_camera() 에서 동적 계산
 MAX_VEHICLE_DIST = 60.0         # 이 거리(m) 초과 차량은 수집 제외 (너무 작아 품질 저하)
 
-IMG_WIDTH     = 1280
-IMG_HEIGHT    = 720
+IMG_WIDTH     = 1920
+IMG_HEIGHT    = 1080
 FOV           = 90.0            # 85 → 90 (교차로 전체가 시야에 들어오도록)
 
 OUTPUT_DIR    = "data/vehicle_images"
@@ -59,10 +60,21 @@ SAVE_RAW      = False           # 원본 프레임도 저장할지 여부
 # --- BBox 필터링 ---
 MIN_BBOX_PX      = 20           # 30 → 20 (CCTV 뷰에서 멀리 보이는 차량도 수집)
 MAX_BBOX_PX      = 1000          # 400 → 1000 (트럭/버스 전체가 한 장에 들어오도록)
-CAPTURE_COOLDOWN = 0.5          # 1.0 → 0.5초 (더 많은 각도/장면 수집)
+CAPTURE_COOLDOWN = 0.5          # 중복 캡처 방지 쿨다운 (0.8 → 0.5초로 단축)
+MIN_CAPTURE_DIST = 2.0          # m — 마지막 캡처 위치에서 이 거리 이상 이동해야 재캡처
+                                #   (4.0 → 2.0m 완화, 정지 차량은 10초 후 예외 허용)
+STATIONARY_RECAPTURE_SEC = 10.0 # 정지 차량도 이 시간(초) 지나면 위치 무관 재캡처 허용
+
+# --- Stuck 차량 감지 설정 ---
+STUCK_CHECK_INTERVAL = 100      # 프레임마다 stuck 체크
+STUCK_SPEED_THRESHOLD = 0.5     # m/s 미만이면 정지로 판단
+STUCK_MAX_COUNT  = 3            # 3회 연속(= 약 15초) 정지 감지 시 제거·재생성
+
+# --- cast_ray 캐싱 설정 ---
+VISIBILITY_CACHE_FRAMES = 10    # 10프레임(0.5초)마다 가시성 재계산
 
 # --- 시뮬레이션 규모 ---
-NUM_NPC       = 100              # 40 → 100 (차량 수 증가)
+NUM_NPC       = 80              # 40 → 100 (차량 수 증가)
 SIM_DURATION  = 300             # 180 → 300초 (더 많은 데이터 수집)
 
 # --- 수집 대상 차종 (CARLA base_type 기준) ---
@@ -83,8 +95,8 @@ CLASS_COLORS = {
 }
 
 # --- 수집 목표량 (클래스당) ---
-# 4개 클래스 균등 수집 (car / truck / van / bus 각 5,000장 = 총 20,000장)
-TARGET_PER_CLASS = 5000    # 클래스당 수집 목표 장수
+# 4개 클래스 균등 수집 (car / truck / van / bus 각 2,500장 = 총 10,000장)
+TARGET_PER_CLASS = 2500    # 클래스당 수집 목표 장수
 
 # --- 날씨 로테이션 설정 ---
 # 동일한 환경에서만 수집 시 모델이 특정 조명·노면에 과적합되는 문제 방지
@@ -109,7 +121,7 @@ MAP_LIST = [
     "Town05", "Town06", "Town07", "Town10HD"
 ]
 
-FRAMES_PER_MAP = 6000  # 맵당 수집 프레임 수
+FRAMES_PER_MAP = 3000  # 맵당 수집 프레임 수
 
 
 # =============================================
@@ -286,19 +298,30 @@ def find_cctv_mount_position(world, junction_center):
               f"({fallback.x:.1f}, {fallback.y:.1f})")
         return fallback
 
-    # junction 진입로 waypoint 중 가장 SW 방향 선택
-    best_loc   = None
-    best_score = -float("inf")
+    # junction 진입로 waypoint 중 가장 SW 방향 선택 (waypoint 객체 보존)
+    best_wp_obj = None
+    best_score  = -float("inf")
     for entry_wp, _ in junction.get_waypoints(carla.LaneType.Driving):
         loc = entry_wp.transform.location
         # SW 점수: 서쪽(x 감소) + 남쪽(y 증가) 합
         score = (junction_center.x - loc.x) + (loc.y - junction_center.y)
         if score > best_score:
-            best_score = score
-            best_loc   = loc
+            best_score  = score
+            best_wp_obj = entry_wp
 
-    if best_loc is None:
+    if best_wp_obj is None:
         best_loc = junction_center
+    else:
+        # ── 핵심 수정 ──
+        # junction.get_waypoints()가 반환하는 wp는 교차로 경계에 있어
+        # 교차로 중심과의 수평 거리가 수 m에 불과한 경우가 많음.
+        # → 이 상태로 카메라를 6m 높이에 올리면 pitch가 거의 수직(바닥 응시) 됨.
+        # previous(MOUNT_BACK_DIST)로 도로를 따라 교차로에서 멀어지는 방향으로 이동,
+        # 카메라가 교차로를 적절한 각도로 내려다볼 수 있는 거리를 확보.
+        MOUNT_BACK_DIST = 15.0   # 교차로 경계에서 도로 따라 후퇴할 거리 (m)
+        prev_wps = best_wp_obj.previous(MOUNT_BACK_DIST)
+        best_loc = (prev_wps[0].transform.location if prev_wps
+                    else best_wp_obj.transform.location)
 
     print(f"[DataCollector] CCTV 도로 마운트 위치: "
           f"({best_loc.x:.1f}, {best_loc.y:.1f}, z={best_loc.z:.1f})")
@@ -336,8 +359,30 @@ def spawn_cctv_camera(world, junction_center):
     dy = junction_center.y - cam_y
     dz = junction_center.z - cam_z          # 음수: 교차로는 카메라보다 아래
     horiz_dist = math.sqrt(dx * dx + dy * dy)
+
+    # ── 수평 거리 최솟값 보장 ──
+    # horiz_dist < MIN_HORIZ_DIST 이면 pitch가 너무 가팔라져 바닥만 찍힘.
+    # 교차로 반대 방향으로 카메라를 강제 이동하여 최소 수평 거리 확보.
+    MIN_HORIZ_DIST = 12.0
+    if horiz_dist < MIN_HORIZ_DIST:
+        if horiz_dist > 0.1:
+            ratio = MIN_HORIZ_DIST / horiz_dist
+            cam_x = junction_center.x - dx * ratio
+            cam_y = junction_center.y - dy * ratio
+        else:
+            # 수평 벡터가 거의 0 → 임의 방향(SW)으로 강제 배치
+            cam_x = junction_center.x - MIN_HORIZ_DIST * 0.7
+            cam_y = junction_center.y + MIN_HORIZ_DIST * 0.7
+        dx = junction_center.x - cam_x
+        dy = junction_center.y - cam_y
+        horiz_dist = math.sqrt(dx * dx + dy * dy)
+        print(f"[DataCollector] ⚠ 수평 거리 부족 → 카메라 강제 이동: "
+              f"({cam_x:.1f}, {cam_y:.1f})  horiz={horiz_dist:.1f}m")
+
     yaw   = math.degrees(math.atan2(dy, dx))
     pitch = math.degrees(math.atan2(dz, horiz_dist))
+    # pitch 클램핑: -50° 이상 유지 (수직 바닥 응시 방지 최후 안전망)
+    pitch = max(pitch, -50.0)
 
     cam_transform = carla.Transform(
         carla.Location(x=cam_x, y=cam_y, z=cam_z),
@@ -419,7 +464,7 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
 
     vehicles = []
     tm = client.get_trafficmanager(8000)
-    tm.set_global_distance_to_leading_vehicle(2.0)
+    tm.set_global_distance_to_leading_vehicle(1.5)   # 2.0 → 1.5 (차간 간격 줄여 연쇄 정체 완화)
 
     # 4개 클래스를 순서대로 순환 스폰 (car→truck→van→bus→car→...)
     class_cycle = itertools.cycle(TARGET_CLASSES)
@@ -438,6 +483,15 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
         actor = world.try_spawn_actor(bp, sp)
         if actor:
             actor.set_autopilot(True, tm.get_port())
+            # ── 차량별 TM 파라미터 다양화 → 정체·충돌·멈춤 현상 완화 ──
+            tm.auto_lane_change(actor, True)
+            tm.distance_to_leading_vehicle(actor, random.uniform(1.0, 3.0))
+            tm.vehicle_percentage_speed_difference(actor, random.uniform(-10, 10))
+            # 신호등 일부 무시 → 신호 대기로 교차로가 꽉 막히는 현상 완화
+            tm.ignore_lights_percentage(actor, 30)
+            # 적극적 차선 변경 → 앞차에 막혀 정체될 때 우회 유도
+            tm.random_left_lanechange_percentage(actor, 40)
+            tm.random_right_lanechange_percentage(actor, 40)
             vehicles.append(actor)
 
     # 실제 스폰된 클래스별 카운트 집계
@@ -624,26 +678,26 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
         cv2.putText(display, text, (x + 2, y - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-    # ── 상단 정보 패널 (4개 프로그레스 바 수용: 130px) ──
-    panel_h = 130
+    # ── 상단 정보 패널 (1920×1080 기준: 4개 프로그레스 바 수용 220px) ──
+    panel_h = 220
     overlay = display.copy()
     cv2.rectangle(overlay, (0, 0), (display.shape[1], panel_h), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
 
-    # 기본 정보 텍스트 (날씨 이름 포함)
+    # 기본 정보 텍스트 (맵 이름 + 날씨 포함)
     weather_label = weather_name if weather_name else "-"
     map_label = map_name if map_name else "-"
-    info = (f"Map: {map_label}  |  Frame: {frame_idx}  |  Detected: {len(detections)}  |  "
+    info = (f"[{map_label}]  Frame: {frame_idx}  |  Detected: {len(detections)}  |  "
             f"Weather: {weather_label}  |  NPC: {NUM_NPC}  |  [Q] Quit")
-    cv2.putText(display, info, (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    cv2.putText(display, info, (20, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
 
-    # ── 수집 진행률 프로그레스 바 (4개 클래스) ──
-    bar_w  = 250          # 프로그레스 바 최대 너비
-    bar_h  = 16           # 프로그레스 바 높이
-    bar_x  = 10           # 시작 X
-    gap    = 24           # 바 간격 (bar_h + 여백)
-    bar_y0 = 38           # 첫 번째 바 Y 시작
+    # ── 수집 진행률 프로그레스 바 (4개 클래스, 1920px 기준) ──
+    bar_w  = 500          # 프로그레스 바 최대 너비 (1920 기준 확대)
+    bar_h  = 28           # 프로그레스 바 높이
+    bar_x  = 20           # 시작 X
+    gap    = 40           # 바 간격 (bar_h + 여백)
+    bar_y0 = 68           # 첫 번째 바 Y 시작
 
     for i, cls in enumerate(TARGET_CLASSES):
         count = saved_counts.get(cls, 0)
@@ -658,10 +712,10 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
         cv2.rectangle(display, (bar_x, bar_y),
                       (bar_x + int(bar_w * ratio), bar_y + bar_h), color, -1)
         # 텍스트
-        label_str = f"{cls.capitalize():<5}: {count:>5}/{TARGET_PER_CLASS} ({ratio*100:5.1f}%)"
+        label_str = f"{cls.capitalize():<5}: {count:>4}/{TARGET_PER_CLASS} ({ratio*100:5.1f}%)"
         cv2.putText(display, label_str,
-                    (bar_x + bar_w + 10, bar_y + bar_h - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1)
+                    (bar_x + bar_w + 16, bar_y + bar_h - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
 
     return display
 
@@ -669,7 +723,8 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
 # =============================================
 # 메인 데이터 수집 루프
 # =============================================
-def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str):
+def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str,
+                    client=None, vehicles: list = None):
     """
     Ground Truth 기반 차량 이미지 자동 캡처 + 화면 디버그 뷰
 
@@ -682,14 +737,26 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
         - 날씨 로테이션 추가 (WEATHER_CHANGE_INTERVAL 프레임마다 순환)
           → WEATHER_PRESETS 7가지를 순서대로 적용
           → 단일 환경 과적합 방지 및 데이터 다양성 확보
+        - FRAMES_PER_MAP 기반 종료 (SIM_DURATION 시간 방식 → 프레임 수 방식으로 교체)
+        - NPC 차량 100프레임마다 생존 확인 → 절반 이하 소멸 시 자동 재생성
     """
     K = build_projection_matrix(IMG_WIDTH, IMG_HEIGHT, FOV)
 
     # 차량별 마지막 캡처 시각 (중복 방지)
     last_capture: dict[int, float] = {}
+    # 차량별 마지막 캡처 위치 (x, y) — 신호 대기·정체 중 같은 장면 반복 캡처 방지
+    last_capture_pos: dict[int, tuple] = {}
 
-    saved_counts: dict[str, int] = {cls: 0 for cls in TARGET_CLASSES}
+    # ── cast_ray 가시성 캐시: vid -> (last_frame, visible) ──
+    visibility_cache: dict[int, tuple] = {}
+
+    # ── Stuck 차량 카운터: vid -> 연속 정지 횟수 ──
+    stuck_counts: dict[int, int] = {}
+
+    # ★ saved_counts는 main()에서 넘어온 global_saved_counts 참조 —
+    #   절대 새 dict로 재초기화하지 말 것 (맵 간 누적 카운트 파괴됨)
     frame_idx = 0
+    user_quit = False   # Q키 종료 시 main() 루프도 함께 빠져나오기 위한 플래그
 
     # ── 날씨 로테이션 초기화 ──
     weather_idx     = 0
@@ -697,17 +764,36 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
     set_weather(world, current_weather)   # 첫 번째 날씨 즉시 적용
 
     cv2.namedWindow("CARLA DataCollector - CCTV View", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("CARLA DataCollector - CCTV View", 1280, 720)
+    cv2.resizeWindow("CARLA DataCollector - CCTV View", 1920, 1080)
 
+    progress_str = "  ".join(
+        f"{cls}: {saved_counts.get(cls, 0)}/{TARGET_PER_CLASS}"
+        for cls in TARGET_CLASSES
+    )
     print(
-        f"[DataCollector] 데이터 수집 시작 ({SIM_DURATION}초) — [Q]키로 종료\n"
+        f"[DataCollector] 수집 시작 [{map_name}] ({FRAMES_PER_MAP}프레임) — [Q]키로 전체 종료\n"
+        f"  현재 누적: {progress_str}\n"
         f"  날씨 로테이션: {len(WEATHER_PRESETS)}종 × {WEATHER_CHANGE_INTERVAL}프레임 주기"
     )
     start_time = time.time()
 
+    consecutive_tick_errors = 0   # 연속 world.tick() 오류 카운터 (CARLA 연결 끊김 감지용)
     try:
-        while time.time() - start_time < SIM_DURATION:
-            world.tick()
+        while frame_idx < FRAMES_PER_MAP:
+            # ── world.tick() 오류 내성 ──
+            # CARLA 일시적 오류 시 최대 5회 재시도, 연속 실패 시 이 맵 세션 강제 종료
+            try:
+                world.tick()
+                consecutive_tick_errors = 0
+            except Exception as _tick_err:
+                consecutive_tick_errors += 1
+                print(f"[DataCollector] ⚠ world.tick() 실패 "
+                      f"({consecutive_tick_errors}/5): {_tick_err}")
+                if consecutive_tick_errors >= 5:
+                    print("[DataCollector] tick 연속 실패 → 이 맵 세션 강제 종료")
+                    break
+                time.sleep(0.5)
+                continue
 
             # 이미지 큐에서 최신 프레임 가져오기
             try:
@@ -733,6 +819,42 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
                 current_weather = WEATHER_PRESETS[weather_idx]
                 set_weather(world, current_weather)
 
+            # ── NPC 수 유지 + Stuck 차량 감지 (STUCK_CHECK_INTERVAL 프레임마다) ──
+            if client is not None and vehicles is not None and frame_idx > 0 and frame_idx % STUCK_CHECK_INTERVAL == 0:
+                live = [v for v in vehicles if v.is_alive]
+
+                # 속도 체크 → STUCK_MAX_COUNT 연속 정지이면 제거
+                to_remove = []
+                for v in live:
+                    try:
+                        vel = v.get_velocity()
+                        speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+                    except Exception:
+                        continue
+                    if speed < STUCK_SPEED_THRESHOLD:
+                        stuck_counts[v.id] = stuck_counts.get(v.id, 0) + 1
+                        if stuck_counts[v.id] >= STUCK_MAX_COUNT:
+                            to_remove.append(v)
+                            stuck_counts.pop(v.id, None)
+                    else:
+                        stuck_counts.pop(v.id, None)
+
+                if to_remove:
+                    print(f"[DataCollector] ⚠ stuck 차량 {len(to_remove)}대 제거 → 재생성")
+                    for v in to_remove:
+                        try:
+                            if v.is_alive:
+                                v.destroy()
+                        except BaseException:
+                            pass
+                    live = [v for v in live if v.is_alive and v not in to_remove]
+
+                need = NUM_NPC - len(live)
+                if need > 0:
+                    print(f"[DataCollector] ⚠ NPC {need}대 재생성 (생존: {len(live)}/{NUM_NPC})")
+                    new_vehicles = spawn_npc_vehicles(client, world, num=need)
+                    vehicles[:] = live + new_vehicles
+
             # 현재 월드의 모든 차량 가져오기
             actor_list = world.get_actors().filter("vehicle.*")
             now = time.time()
@@ -750,8 +872,14 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
                 if not is_valid_vehicle_actor(vehicle):
                     continue
 
-                # ── 벽/건물에 가려진 차량 제외 (cast_ray 가시성 체크) ──
-                if not is_vehicle_visible(world, cam_loc, vehicle):
+                # ── 벽/건물에 가려진 차량 제외 (cast_ray — 캐시로 10프레임마다 재계산) ──
+                cache_entry = visibility_cache.get(vid)
+                if cache_entry and (frame_idx - cache_entry[0]) < VISIBILITY_CACHE_FRAMES:
+                    visible = cache_entry[1]
+                else:
+                    visible = is_vehicle_visible(world, cam_loc, vehicle)
+                    visibility_cache[vid] = (frame_idx, visible)
+                if not visible:
                     continue
 
                 label = get_vehicle_class_actor(vehicle)
@@ -775,6 +903,18 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
                 if now - last_capture.get(vid, 0) < CAPTURE_COOLDOWN:
                     continue
 
+                # 이동 거리 체크 — 정지 차량은 STATIONARY_RECAPTURE_SEC 초 후 예외 허용
+                cur_loc = vehicle.get_location()
+                last_pos = last_capture_pos.get(vid)
+                if last_pos is not None:
+                    moved = math.sqrt(
+                        (cur_loc.x - last_pos[0]) ** 2 +
+                        (cur_loc.y - last_pos[1]) ** 2
+                    )
+                    time_since_capture = now - last_capture.get(vid, 0)
+                    if moved < MIN_CAPTURE_DIST and time_since_capture < STATIONARY_RECAPTURE_SEC:
+                        continue
+
                 # 크롭 & 저장
                 x, y, w, h = bbox
                 crop = frame_bgr[y:y + h, x:x + w]
@@ -786,6 +926,7 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
                 save_path = os.path.join(OUTPUT_DIR, label, filename)
                 cv2.imwrite(save_path, crop)
                 last_capture[vid] = now
+                last_capture_pos[vid] = (cur_loc.x, cur_loc.y)   # 캡처 위치 기록
 
                 saved_counts[label] = saved_counts.get(label, 0) + 1
 
@@ -797,18 +938,32 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
                       f"  {count_str}  (목표: {TARGET_PER_CLASS}장/클래스)")
                 break
 
-            # 디버그 오버레이 화면 표시
-            display = draw_debug_overlay(frame_bgr, detections,
-                                         frame_idx, saved_counts,
-                                         current_weather, map_name)
-            cv2.imshow("CARLA DataCollector - CCTV View", display)
+            # 디버그 오버레이 화면 표시 — 3프레임마다 1회 갱신 (imshow 병목 완화)
+            if frame_idx % 3 == 0:
+                try:
+                    display = draw_debug_overlay(frame_bgr, detections,
+                                                 frame_idx, saved_counts,
+                                                 current_weather, map_name)
+                    cv2.imshow("CARLA DataCollector - CCTV View", display)
+
+                    # X 버튼으로 창이 닫혔는지 감지
+                    if cv2.getWindowProperty("CARLA DataCollector - CCTV View",
+                                             cv2.WND_PROP_VISIBLE) < 1:
+                        print("[DataCollector] OpenCV 창 닫힘 감지 → 다음 맵으로 계속")
+                        break
+                except Exception:
+                    pass   # 화면 표시 오류는 데이터 수집을 중단하지 않음
 
             frame_idx += 1
 
-            # Q 키 누르면 종료
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[DataCollector] 사용자 종료 요청")
-                break
+            # Q 키 누르면 이 맵 세션 + 전체 루프 모두 종료 (매 프레임 체크 유지)
+            try:
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    print("[DataCollector] 사용자 종료 요청 — 전체 수집 중단")
+                    user_quit = True
+                    break
+            except Exception:
+                pass
 
             # 진행 상황 50프레임마다 출력
             if frame_idx % 50 == 0:
@@ -822,13 +977,24 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
                       f"Weather: {current_weather} | {count_str}")
 
     finally:
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()가 Windows WM_QUIT 메시지를 처리하면서
+        # 프로세스 종료 신호(SystemExit/BaseException)를 발생시킬 수 있으므로
+        # except BaseException 으로 보호 (except Exception 은 SystemExit 를 잡지 못함)
+        try:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)   # 잔류 메시지 큐 비우기 (Windows 안정화)
+        except BaseException:
+            pass
 
-    print(f"\n[DataCollector] 수집 완료!")
-    print(f"  총 프레임 : {frame_idx}")
-    for cls in TARGET_CLASSES:
-        print(f"  저장 {cls:<5}: {saved_counts.get(cls, 0)}장")
-    print(f"  저장 경로 : {OUTPUT_DIR}/")
+    # ── 맵 세션 종료 메시지 (전체 수집 완료가 아닌 이 맵의 수집 종료) ──
+    final_progress = "  ".join(
+        f"{cls}: {saved_counts.get(cls, 0)}/{TARGET_PER_CLASS}"
+        for cls in TARGET_CLASSES
+    )
+    print(f"\n[DataCollector] [{map_name}] 세션 완료 | 프레임: {frame_idx}")
+    print(f"  누적 수집: {final_progress}")
+    print(f"  저장 경로: {OUTPUT_DIR}/")
+    return user_quit
 
 
 # =============================================
@@ -836,56 +1002,137 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str)
 # =============================================
 def main():
     setup_output_dirs()
-    # 맵 로드 시간이 길어질 수 있으므로 타임아웃을 20초로 설정합니다.
     client = carla.Client(CARLA_HOST, CARLA_PORT)
-    client.set_timeout(20.0) 
+    # Town10HD 등 대형 맵은 로드에 30~60초 소요 — 타임아웃 부족 시 RuntimeError 크래시
+    client.set_timeout(120.0)
 
-    # 맵이 바뀌어도 유지되는 전역 카운트 변수
+    # 맵이 바뀌어도 유지되는 전역 카운트 변수 (collect_dataset에 참조로 전달)
     global_saved_counts = {cls: 0 for cls in TARGET_CLASSES}
+    user_quit = False   # Q키로 전체 종료 여부
+
     for map_name in MAP_LIST:
+        if user_quit:   # 이전 맵에서 Q 키 → 루프 즉시 탈출
+            break
+
         print(f"\n[DataCollector] === 맵 로드 중: {map_name} ===")
-        world = client.load_world(map_name)
 
-        # 동기 모드 설정 (tick() 제어를 위해 권장)
-        settings = world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.05   # 20 FPS
-        world.apply_settings(settings)
-
-        intersection_loc = find_intersection(world)
-        camera, img_queue = spawn_cctv_camera(world, intersection_loc)
-
-        # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
-        # (기존 단일 랜덤 선택 제거 → 다양성 자동 확보)
-
-        vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
-
-        # 배경 워밍업 (차량들이 이동을 시작하도록 대기)
-        print("[DataCollector] 배경 워밍업 중...")
-        for _ in range(50):
-            world.tick()
-            try:
-                img_queue.get_nowait()
-            except queue.Empty:
-                pass
+        # ★ finally 에서 None 체크 후 정리하기 위해 미리 초기화
+        camera   = None
+        vehicles = []
+        world    = None
+        tm       = None
+        settings = None
 
         try:
-            collect_dataset(world, camera, img_queue, global_saved_counts, map_name)
-        finally:
-            # 동기 모드 해제
-            settings.synchronous_mode = False
-            world.apply_settings(settings)
+            # ── 맵 로드 + CARLA 서버 안정화 ──
+            # load_world 는 동기 블로킹 호출이지만, 반환 직후 서버 내부 초기화가
+            # 아직 진행 중일 수 있으므로 sleep 으로 완전 안정화를 보장
+            world = client.load_world(map_name)
+            time.sleep(5.0)   # 맵 전환 후 CARLA 서버 완전 안정화 대기 (2→5초)
 
+            # 트래픽 매니저 초기화
+            tm = client.get_trafficmanager(8000)
+
+            # 동기 모드 설정 (tick() 제어를 위해 권장)
+            settings = world.get_settings()
+            settings.synchronous_mode   = True
+            settings.fixed_delta_seconds = 0.05   # 20 FPS
+            world.apply_settings(settings)
+            tm.set_synchronous_mode(True)
+
+            intersection_loc = find_intersection(world)
+            camera, img_queue = spawn_cctv_camera(world, intersection_loc)
+
+            # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
+            vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
+
+            # 배경 워밍업 (차량들이 이동을 시작하도록 대기)
+            print("[DataCollector] 배경 워밍업 중...")
+            for _ in range(80):   # 50 → 80 tick (안정화 시간 확보)
+                try:
+                    world.tick()
+                except Exception:
+                    pass
+                try:
+                    img_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+            user_quit = collect_dataset(
+                world, camera, img_queue, global_saved_counts, map_name,
+                client=client, vehicles=vehicles,
+            )
+
+        except BaseException as exc:
+            # ── BaseException 으로 변경한 이유 ──
+            # CARLA Python 바인딩(pybind11)이 던지는 일부 예외는
+            # Python Exception 계층을 올바르게 상속하지 않을 수 있음.
+            # 또한 SystemExit / KeyboardInterrupt 도 여기서 일괄 처리해
+            # finally 블록이 항상 정리를 수행하도록 보장.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                # 명시적 종료 신호 → 루프 탈출 플래그 세팅 후 정리 진행
+                print(f"\n[DataCollector] 종료 신호({type(exc).__name__}) → 전체 수집 중단")
+                user_quit = True
+            else:
+                # CARLA 오류·타임아웃·스폰 실패 등 → 전체 트레이스 출력 후 다음 맵으로
+                print(f"[DataCollector] ⚠  {map_name} 오류 발생 → 다음 맵으로 계속")
+                traceback.print_exc()   # ← 실제 오류 원인을 콘솔에 출력 (진단 필수)
+
+        finally:
             print(f"[DataCollector] {map_name} 에셋 정리 중...")
-            camera.stop()
-            camera.destroy()
+
+            # 카메라 안전 삭제
+            if camera is not None:
+                try:
+                    camera.stop()
+                    camera.destroy()
+                except BaseException:
+                    pass
+
+            # NPC 차량 안전 삭제 (이미 파괴된 차량 에러 무시)
             for v in vehicles:
-                v.destroy()
-            
-            if all(global_saved_counts.get(cls, 0) >= TARGET_PER_CLASS for cls in TARGET_CLASSES):
-                print("[DataCollector] 모든 목표 수량 달성 완료. 전체 수집을 종료합니다.")
-                break
-            
+                try:
+                    if v.is_alive:
+                        v.destroy()
+                except BaseException:
+                    pass
+
+            # ★ world.apply_settings(sync=False) 호출 금지 ★
+            # sync → async 전환 시 CARLA C++ 클라이언트가 내부적으로 exit() 를
+            # 호출해 프로세스가 조용히 종료되는 현상이 확인됨.
+            # 대신 world.tick() 으로 서버 상태를 flush 한 뒤
+            # load_world(reset_settings=True, 기본값) 가 자동으로 sync 모드를 해제.
+            if world is not None:
+                for _ in range(3):
+                    try:
+                        world.tick()
+                    except BaseException:
+                        break
+
+            # 다음 맵 load_world 전 CARLA 서버 정리 시간 확보
+            try:
+                time.sleep(2.0)
+            except BaseException:
+                pass
+
+        # ── 맵 루프 탈출 조건 (finally 블록 밖에서 평가) ──
+        # finally 안에 break 를 두면 예외가 마스킹되거나 의도치 않은 루프 탈출이 발생
+        all_done = all(
+            global_saved_counts.get(cls, 0) >= TARGET_PER_CLASS
+            for cls in TARGET_CLASSES
+        )
+        if all_done:
+            print("[DataCollector] ✓ 전 클래스 목표 달성! 전체 수집 종료.")
+        if all_done or user_quit:
+            break
+
+    # ── 전체 수집 결과 최종 출력 ──
+    print(f"\n[DataCollector] ══ 전체 수집 완료 ══")
+    for cls in TARGET_CLASSES:
+        n = global_saved_counts.get(cls, 0)
+        pct = min(n / TARGET_PER_CLASS * 100, 100)
+        print(f"  {cls:<5}: {n:>4}장 / {TARGET_PER_CLASS}장 ({pct:.1f}%)")
+    print(f"  저장 경로 : {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
