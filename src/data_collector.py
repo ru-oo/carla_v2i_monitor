@@ -426,7 +426,7 @@ def set_weather(world, preset: str = "clear_noon"):
     print(f"[DataCollector] 날씨 변경 → {preset}")
 
 
-def spawn_npc_vehicles(client, world, num=NUM_NPC):
+def spawn_npc_vehicles(client, world, tm, num=NUM_NPC):
     """
     NPC 차량 자동 생성 및 자율주행 활성화
 
@@ -434,6 +434,7 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
         - TARGET_CLASSES 순서로 round-robin 순환하여 25:25:25:25 비율 목표
         - 클래스 내 블루프린트를 itertools.cycle로 순환
           → 동일 모델 연속 스폰 방지 + 모든 차량 모델 균등 수집
+        - tm: 외부에서 주입 (맵별 고유 포트 TM → 이전 맵 토폴로지 오염 방지)
     """
     bp_lib = world.get_blueprint_library()
     spawn_points = world.get_map().get_spawn_points()
@@ -464,8 +465,8 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
           f"(motorcycle/bicycle/trailer 제외)")
 
     vehicles = []
-    tm = client.get_trafficmanager(8000)
-    # 전역 차간 거리 2.5m — 너무 좁으면 추돌·정체 연쇄 발생
+    # tm은 외부(main)에서 주입 — 내부에서 get_trafficmanager() 호출 금지
+    # (같은 포트 재사용 시 이전 맵 도로 토폴로지가 캐시에 남아 역주행 발생)
     tm.set_global_distance_to_leading_vehicle(2.5)
 
     # 4개 클래스를 순서대로 순환 스폰 (car→truck→van→bus→car→...)
@@ -725,7 +726,7 @@ def draw_debug_overlay(img_bgr, detections, frame_idx,
 # 메인 데이터 수집 루프
 # =============================================
 def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str,
-                    client=None, vehicles: list = None):
+                    client=None, vehicles: list = None, tm=None):
     """
     Ground Truth 기반 차량 이미지 자동 캡처 + 화면 디버그 뷰
 
@@ -858,7 +859,7 @@ def collect_dataset(world, camera, img_queue, saved_counts: dict, map_name: str,
                 need = NUM_NPC - len(live)
                 if need > 0:
                     print(f"[DataCollector] ⚠ NPC {need}대 재생성 (생존: {len(live)}/{NUM_NPC})")
-                    new_vehicles = spawn_npc_vehicles(client, world, num=need)
+                    new_vehicles = spawn_npc_vehicles(client, world, tm, num=need)
                     vehicles[:] = live + new_vehicles
 
             # 현재 월드의 모든 차량 가져오기 (3프레임마다 갱신)
@@ -1018,7 +1019,7 @@ def main():
     global_saved_counts = {cls: 0 for cls in TARGET_CLASSES}
     user_quit = False   # Q키로 전체 종료 여부
 
-    for map_name in MAP_LIST:
+    for map_idx, map_name in enumerate(MAP_LIST):
         if user_quit:   # 이전 맵에서 Q 키 → 루프 즉시 탈출
             break
 
@@ -1038,8 +1039,14 @@ def main():
             world = client.load_world(map_name)
             time.sleep(5.0)   # 맵 전환 후 CARLA 서버 완전 안정화 대기 (2→5초)
 
-            # 트래픽 매니저 초기화
-            tm = client.get_trafficmanager(8000)
+            # ── 맵별 고유 TM 포트 사용 ──
+            # 같은 포트(8000)를 재사용하면 이전 맵의 도로 토폴로지가 TM 캐시에
+            # 남아서 Town02+ 차량이 Town01 경로 기준으로 주행 → 도로 이탈 발생.
+            # 맵마다 다른 포트(8000, 8001, 8002...)를 쓰면 완전히 새 TM 인스턴스가
+            # 생성되어 현재 맵 도로 정보만 사용하므로 이 문제가 완전히 해결됨.
+            tm_port = 8000 + map_idx
+            tm = client.get_trafficmanager(tm_port)
+            print(f"[DataCollector] TM 포트: {tm_port} (맵별 고유 인스턴스)")
 
             # 동기 모드 설정 (tick() 제어를 위해 권장)
             settings = world.get_settings()
@@ -1063,7 +1070,7 @@ def main():
             camera, img_queue = spawn_cctv_camera(world, intersection_loc)
 
             # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
-            vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
+            vehicles = spawn_npc_vehicles(client, world, tm, num=NUM_NPC)
 
             # 배경 워밍업 (차량들이 올바른 차선에 안착하도록 충분히 대기)
             print("[DataCollector] 배경 워밍업 중...")
@@ -1079,7 +1086,7 @@ def main():
 
             user_quit = collect_dataset(
                 world, camera, img_queue, global_saved_counts, map_name,
-                client=client, vehicles=vehicles,
+                client=client, vehicles=vehicles, tm=tm,
             )
 
         except BaseException as exc:
