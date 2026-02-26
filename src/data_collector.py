@@ -37,18 +37,14 @@ import math
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
 
-# --- CCTV 카메라 설정 (교차로 남서 코너 상공 CCTV) ---
-# 이미지 참고: 남서쪽 상공에서 북동 방향으로 교차로 전체를 내려다보는 구도
-# - 왼쪽: 미술관/쇼핑 건물, 오른쪽: 나무/주거 건물, 중앙: 교차로 격자
-#
-# 높이 28m: Town10HD 최고 건물(25m)보다 높아 건물 내부 스폰 방지
-# 수평 오프셋 (-20, +20) → 대각 거리 ≈ 28m = 높이
-# → arctan(28/28) = 45° : pitch -45° 와 정확히 일치
-CAMERA_HEIGHT    = 28.0         # 건물 최상단 위 (Town10 기준 25m+ 건물 회피)
-CAMERA_PITCH     = -45.0        # 수평거리 == 높이 → 정확한 45° 하향각
-CAMERA_OFFSET_X  = -20.0        # 서쪽 오프셋 (남서 코너, CARLA x축 동향)
-CAMERA_OFFSET_Y  = 20.0         # 남쪽 오프셋 (남서 코너, CARLA y축 남향)
-CAMERA_YAW       = -45.0        # 북동 방향으로 교차로 중심을 향함
+# --- CCTV 카메라 설정 (실제 교차로 신호등 폴 CCTV) ---
+# 배치 전략:
+#   1. junction.get_waypoints()로 SW 진입로 도로 위 좌표 확보 (건물 내부 방지)
+#   2. 해당 위치에서 CAMERA_HEIGHT(6m) 올려 신호등 폴 높이 재현
+#   3. 교차로 중심까지 yaw / pitch 를 수학적으로 자동 계산
+CAMERA_HEIGHT    = 6.0          # 실제 신호등 CCTV 폴 높이 (m)
+# pitch / yaw / offset 은 spawn_cctv_camera() 에서 동적 계산
+MAX_VEHICLE_DIST = 60.0         # 이 거리(m) 초과 차량은 수집 제외 (너무 작아 품질 저하)
 
 IMG_WIDTH     = 1280
 IMG_HEIGHT    = 720
@@ -174,16 +170,71 @@ def find_intersection(world):
     return carla.Location(x=loc.x, y=loc.y, z=loc.z)
 
 
-def spawn_cctv_camera(world, intersection_loc):
+def find_cctv_mount_position(world, junction_center):
     """
-    교차로 코너에 실제 CCTV처럼 카메라 설치
+    교차로 SW 진입로의 도로 위 좌표 탐색 (건물 내부 스폰 방지 핵심 함수)
+
+    고정 오프셋 대신 CARLA junction API 로 실제 도로 위 waypoint 를 반환.
+    junction.get_waypoints() 가 반환하는 waypoint 는 항상 도로 위에 있음.
+
+    선택 기준: junction 진입로 중 교차로 중심 대비 가장 SW 방향인 waypoint
+               SW 점수 = (중심.x - 위치.x) + (위치.y - 중심.y)
+                          ↑서쪽일수록 큰 값    ↑남쪽일수록 큰 값
+    """
+    carla_map = world.get_map()
+
+    # junction_center 부근의 waypoint 에서 junction 객체 가져오기
+    junction = None
+    search_offsets = [(0,0),(3,0),(-3,0),(0,3),(0,-3),(5,5),(-5,5),(5,-5),(-5,-5)]
+    for ox, oy in search_offsets:
+        test_loc = carla.Location(x=junction_center.x + ox,
+                                  y=junction_center.y + oy,
+                                  z=junction_center.z)
+        wp = carla_map.get_waypoint(test_loc, project_to_road=True)
+        if wp and wp.is_junction:
+            junction = wp.get_junction()
+            break
+
+    if junction is None:
+        # fallback: 교차로 중심에서 SW 방향으로 snap-to-road
+        sw_loc = carla.Location(x=junction_center.x - 15,
+                                y=junction_center.y + 15,
+                                z=junction_center.z)
+        snap_wp = carla_map.get_waypoint(sw_loc, project_to_road=True)
+        fallback = snap_wp.transform.location if snap_wp else junction_center
+        print(f"[DataCollector] junction 없음 → fallback 위치 사용: "
+              f"({fallback.x:.1f}, {fallback.y:.1f})")
+        return fallback
+
+    # junction 진입로 waypoint 중 가장 SW 방향 선택
+    best_loc   = None
+    best_score = -float("inf")
+    for entry_wp, _ in junction.get_waypoints(carla.LaneType.Driving):
+        loc = entry_wp.transform.location
+        # SW 점수: 서쪽(x 감소) + 남쪽(y 증가) 합
+        score = (junction_center.x - loc.x) + (loc.y - junction_center.y)
+        if score > best_score:
+            best_score = score
+            best_loc   = loc
+
+    if best_loc is None:
+        best_loc = junction_center
+
+    print(f"[DataCollector] CCTV 도로 마운트 위치: "
+          f"({best_loc.x:.1f}, {best_loc.y:.1f}, z={best_loc.z:.1f})")
+    return best_loc
+
+
+def spawn_cctv_camera(world, junction_center):
+    """
+    교차로 SW 진입로 도로 위 신호등 폴에 실제 CCTV 배치
 
     배치 방식:
-        - 교차로 중심에서 남서쪽 상공(-X, +Y, +Z)으로 오프셋
-        - 높이 28m : Town10 최고층 건물 위 → 건물 내부 스폰 방지
-        - 수평 오프셋 (-20, +20) → 대각 거리 ≈ 28m = 높이
-          arctan(28/28) = 45° → pitch -45° 와 완벽히 일치
-        - yaw -45° 로 교차로 중심(북동 방향) 향함
+        1. find_cctv_mount_position() 으로 SW 진입로 도로 위 좌표 확보
+           → 고정 오프셋 사용 시 건물 내부 스폰 문제 완전 해결
+        2. 해당 좌표 + CAMERA_HEIGHT(6m) = 실제 신호등 CCTV 폴 높이
+        3. 교차로 중심까지 yaw / pitch 를 math.atan2 로 정확히 계산
+           → 어떤 맵, 어떤 교차로에서도 교차로 정중앙을 향함
 
     Returns:
         camera_sensor, image_queue
@@ -194,13 +245,23 @@ def spawn_cctv_camera(world, intersection_loc):
     cam_bp.set_attribute("image_size_y", str(IMG_HEIGHT))
     cam_bp.set_attribute("fov", str(FOV))
 
+    # 도로 위 마운트 좌표 (건물 내부 방지)
+    mount = find_cctv_mount_position(world, junction_center)
+    cam_x = mount.x
+    cam_y = mount.y
+    cam_z = mount.z + CAMERA_HEIGHT
+
+    # 카메라 → 교차로 중심 벡터로 yaw / pitch 자동 계산
+    dx = junction_center.x - cam_x
+    dy = junction_center.y - cam_y
+    dz = junction_center.z - cam_z          # 음수: 교차로는 카메라보다 아래
+    horiz_dist = math.sqrt(dx * dx + dy * dy)
+    yaw   = math.degrees(math.atan2(dy, dx))
+    pitch = math.degrees(math.atan2(dz, horiz_dist))
+
     cam_transform = carla.Transform(
-        carla.Location(
-            x=intersection_loc.x + CAMERA_OFFSET_X,
-            y=intersection_loc.y + CAMERA_OFFSET_Y,
-            z=intersection_loc.z + CAMERA_HEIGHT,
-        ),
-        carla.Rotation(pitch=CAMERA_PITCH, yaw=CAMERA_YAW, roll=0.0),
+        carla.Location(x=cam_x, y=cam_y, z=cam_z),
+        carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0),
     )
 
     img_queue = queue.Queue(maxsize=5)
@@ -208,17 +269,13 @@ def spawn_cctv_camera(world, intersection_loc):
     if camera is None:
         raise RuntimeError(
             f"[DataCollector] 카메라 스폰 실패 — 위치: "
-            f"({cam_transform.location.x:.1f}, {cam_transform.location.y:.1f}, "
-            f"{cam_transform.location.z:.1f})"
+            f"({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f})"
         )
     camera.listen(lambda img: img_queue.put(img) if not img_queue.full() else None)
 
-    cctv_x = intersection_loc.x + CAMERA_OFFSET_X
-    cctv_y = intersection_loc.y + CAMERA_OFFSET_Y
-    cctv_z = intersection_loc.z + CAMERA_HEIGHT
-    print(f"[DataCollector] 교차로 코너 CCTV 설치: "
-          f"위치=({cctv_x:.1f}, {cctv_y:.1f}, {cctv_z:.1f}m) "
-          f"pitch={CAMERA_PITCH}°  yaw={CAMERA_YAW}°")
+    print(f"[DataCollector] 교차로 CCTV 설치 완료\n"
+          f"  위치  : ({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f}m)\n"
+          f"  pitch : {pitch:.1f}°   yaw : {yaw:.1f}°   FOV : {FOV}°")
     return camera, img_queue
 
 
@@ -279,6 +336,40 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
 # =============================================
 # Ground Truth → 픽셀 좌표 변환
 # =============================================
+def is_vehicle_visible(world, camera_location, vehicle):
+    """
+    카메라에서 차량까지 레이캐스트로 가시성 확인 (벽 너머 차량 필터링)
+
+    원리:
+        world.cast_ray(카메라 위치, 차량 중심) 으로 중간 장애물 검출.
+        첫 번째 히트가 차량까지 거리의 85% 미만이면 벽/건물에 가려진 것.
+
+    Returns:
+        True  → 차량이 카메라에서 보임 (수집 OK)
+        False → 벽/건물에 가려짐 (수집 제외)
+    """
+    veh_loc = vehicle.get_location()
+
+    # 거리 사전 필터: MAX_VEHICLE_DIST 초과 시 제외 (cast_ray 호출 절약)
+    if camera_location.distance(veh_loc) > MAX_VEHICLE_DIST:
+        return False
+
+    try:
+        hits = world.cast_ray(camera_location, veh_loc)
+    except Exception:
+        # cast_ray 미지원 버전 → 필터링 없이 통과
+        return True
+
+    if not hits:
+        return True  # 중간 장애물 없음
+
+    veh_dist       = camera_location.distance(veh_loc)
+    first_hit_dist = camera_location.distance(hits[0].location)
+
+    # 첫 히트가 차량까지 거리의 85% 미만이면 차량 앞에 장애물 존재
+    return first_hit_dist >= veh_dist * 0.85
+
+
 def build_projection_matrix(w, h, fov):
     """
     카메라 내부 행렬(Intrinsic Matrix) 계산
@@ -475,12 +566,18 @@ def collect_dataset(world, camera, img_queue, vehicles):
 
             detections = []
 
+            cam_loc = camera.get_location()   # 가시성 체크용 카메라 위치
+
             for vehicle in actor_list:
                 vid   = vehicle.id
                 bp_id = vehicle.type_id
 
                 # ── 이륜차 / trailer 제외 (나무처럼 보이는 샘플 & 트럭 분할 방지) ──
                 if not is_valid_vehicle(bp_id):
+                    continue
+
+                # ── 벽/건물에 가려진 차량 제외 (cast_ray 가시성 체크) ──
+                if not is_vehicle_visible(world, cam_loc, vehicle):
                     continue
 
                 label = get_vehicle_label(bp_id)
