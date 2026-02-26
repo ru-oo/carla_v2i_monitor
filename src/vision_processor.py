@@ -32,6 +32,7 @@ class DetectedObject:
     world_y: float          # Top-view 변환 후 물리적 Y (m)
     bbox: Tuple[int, int, int, int]   # (x, y, w, h) Bounding Box
     area: float             # 마스크 내 픽셀 면적
+    vehicle_type: str = "unknown"    # CNN 분류 결과: bus/car/truck/van/unknown
 
 
 # =============================================
