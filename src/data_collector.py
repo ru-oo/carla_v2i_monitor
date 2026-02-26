@@ -68,39 +68,97 @@ COLOR_CAR    = (0, 255, 0)      # 초록
 COLOR_TRUCK  = (0, 100, 255)    # 주황
 COLOR_OTHER  = (200, 200, 200)
 
-# 트럭 계열 블루프린트 키워드
-TRUCK_KEYWORDS = ["truck", "van", "bus", "ambulance", "firetruck", "carlacola",
-                  "sprinter", "t2", "cybertruck", "european_hgv"]
+# 트럭 계열 base_type 값 (CARLA blueprint 속성)
+TRUCK_BASE_TYPES = {"truck", "van", "bus"}
 
-# 수집 제외 키워드 (이륜차 / 트레일러)
-# - 이륜차: 카메라 시야에서 나무처럼 보이거나 불필요한 샘플 생성
-# - trailer: 트럭 차체와 별도 액터로 생성되어 분할 수집 발생
-EXCLUDE_VEHICLE_KEYWORDS = [
-    "bike", "cycle", "vespa", "harley", "kawasaki",
-    "yamaha", "ninja", "omafiets", "crossbike", "century",
-    "trailer",
+# 이륜차 base_type 값 (CARLA blueprint 속성) — 키워드 매칭보다 정확
+EXCLUDE_BASE_TYPES = {"motorcycle", "bicycle"}
+
+# --- 수집 목표량 (클래스당) ---
+# 학습 데이터 균형을 위해 car / truck 동일 수량 수집
+TARGET_PER_CLASS = 5000    # 클래스당 수집 목표 장수
+
+# --- 날씨 로테이션 설정 ---
+# 동일한 환경에서만 수집 시 모델이 특정 조명·노면에 과적합되는 문제 방지
+# 7가지 날씨를 순서대로 순환하며 다양한 조건의 데이터 확보
+WEATHER_PRESETS = [
+    "clear_noon",      # 맑은 낮         — 기본 기준 환경
+    "cloudy_noon",     # 흐린 낮          — 그림자 없는 평탄한 조명
+    "wet_noon",        # 젖은 노면 낮     — 비 온 후 반사광 있음
+    "soft_rain_noon",  # 약한 비 낮       — 빗방울 노이즈 소량
+    "hard_rain_noon",  # 강한 비 낮       — 시인성 저하 극단 조건
+    "clear_sunset",    # 석양             — 역광·긴 그림자
+    "clear_night",     # 밤               — 조도 극히 낮은 야간
 ]
+# 20fps 기준 400 프레임 ≈ 20초마다 날씨 변경
+# 300초 수집 시 약 15회 변경 → 7가지 날씨를 2회 이상 순환
+WEATHER_CHANGE_INTERVAL = 400  # 날씨 변경 주기 (프레임 단위)
 
 
 # =============================================
 # 유틸 함수
 # =============================================
-def is_truck(blueprint_id: str) -> bool:
-    """블루프린트 ID로 트럭/대형차 여부 판단"""
-    bp_lower = blueprint_id.lower()
-    return any(kw in bp_lower for kw in TRUCK_KEYWORDS)
-
-
-def is_valid_vehicle(blueprint_id: str) -> bool:
+def get_base_type_from_bp(bp) -> str:
     """
-    데이터 수집에 적합한 4륜 차량인지 확인
+    블루프린트 객체에서 CARLA base_type 속성 추출 (spawn 단계에서 사용)
+
+    base_type 속성값 예시: 'car', 'truck', 'van', 'bus', 'motorcycle', 'bicycle'
+    키워드 매칭 방식보다 CARLA 내부 분류를 직접 활용하므로 신규 블루프린트에도 안정적
+    """
+    try:
+        return bp.get_attribute("base_type").as_str().lower()
+    except Exception:
+        return ""
+
+
+def get_base_type_from_actor(vehicle) -> str:
+    """
+    액터 객체에서 base_type 속성 추출 (collect_dataset 단계에서 사용)
+
+    vehicle.attributes 딕셔너리는 블루프린트와 동일한 속성을 포함
+    """
+    return vehicle.attributes.get("base_type", "").lower()
+
+
+def is_truck_bp(bp) -> bool:
+    """블루프린트 객체로 트럭/대형차 여부 판단 (스폰 단계용)"""
+    return get_base_type_from_bp(bp) in TRUCK_BASE_TYPES
+
+
+def is_valid_vehicle_bp(bp) -> bool:
+    """
+    스폰 단계: 데이터 수집에 적합한 4륜 차량 블루프린트인지 확인
 
     제외 대상:
-        - 이륜차(bicycle / motorcycle): 나무처럼 보이거나 작아서 잡음 데이터 생성
+        - motorcycle / bicycle: base_type 속성으로 정확하게 필터링
+          (기존 키워드 방식은 CARLA 신규 블루프린트 누락 위험)
         - trailer: 트럭과 별개 액터로 생성되어 동일 트럭이 분할 저장되는 원인
     """
-    bp_lower = blueprint_id.lower()
-    return not any(kw in bp_lower for kw in EXCLUDE_VEHICLE_KEYWORDS)
+    base_type = get_base_type_from_bp(bp)
+    if base_type in EXCLUDE_BASE_TYPES:
+        return False
+    if "trailer" in bp.id.lower():
+        return False
+    return True
+
+
+def is_truck_actor(vehicle) -> bool:
+    """액터 객체로 트럭/대형차 여부 판단 (수집 단계용)"""
+    return get_base_type_from_actor(vehicle) in TRUCK_BASE_TYPES
+
+
+def is_valid_vehicle_actor(vehicle) -> bool:
+    """
+    수집 단계: 액터의 base_type 속성으로 이륜차 / trailer 제외
+
+    base_type 속성이 없는 구버전 CARLA 환경을 위한 fallback 포함
+    """
+    base_type = get_base_type_from_actor(vehicle)
+    if base_type in EXCLUDE_BASE_TYPES:
+        return False
+    if "trailer" in vehicle.type_id.lower():
+        return False
+    return True
 
 
 def get_vehicle_label(blueprint_id: str) -> str:
@@ -279,45 +337,59 @@ def spawn_cctv_camera(world, junction_center):
     return camera, img_queue
 
 
-def set_weather(world, preset="clear"):
-    """날씨 설정"""
-    presets = {
-        "clear":  carla.WeatherParameters.ClearNoon,
-        "rain":   carla.WeatherParameters.HardRainNoon,
-        "night":  carla.WeatherParameters.ClearNight,
-        "cloudy": carla.WeatherParameters.CloudyNoon,
+def set_weather(world, preset: str = "clear_noon"):
+    """
+    날씨 설정 — WEATHER_PRESETS 리스트의 이름으로 호출
+
+    지원 프리셋 (WEATHER_PRESETS 참고):
+        clear_noon / cloudy_noon / wet_noon /
+        soft_rain_noon / hard_rain_noon / clear_sunset / clear_night
+    """
+    params_map = {
+        "clear_noon":      carla.WeatherParameters.ClearNoon,
+        "cloudy_noon":     carla.WeatherParameters.CloudyNoon,
+        "wet_noon":        carla.WeatherParameters.WetNoon,
+        "soft_rain_noon":  carla.WeatherParameters.SoftRainNoon,
+        "hard_rain_noon":  carla.WeatherParameters.HardRainNoon,
+        "clear_sunset":    carla.WeatherParameters.ClearSunset,
+        "clear_night":     carla.WeatherParameters.ClearNight,
     }
-    world.set_weather(presets.get(preset, carla.WeatherParameters.ClearNoon))
-    print(f"[DataCollector] 날씨: {preset}")
+    world.set_weather(params_map.get(preset, carla.WeatherParameters.ClearNoon))
+    print(f"[DataCollector] 날씨 변경 → {preset}")
 
 
 def spawn_npc_vehicles(client, world, num=NUM_NPC):
     """
     NPC 차량 자동 생성 및 자율주행 활성화
 
-    변경사항:
-        - 이륜차(bike/cycle/motorcycle) 블루프린트 완전 제외
-        - trailer 제외 (트럭 분할 방지)
-        - 승용차:트럭 = 7:3 비율 유지
+    수정사항:
+        - base_type 속성 기반 필터링으로 교체
+          (키워드 방식은 신규 블루프린트 누락 위험 → base_type이 더 정확)
+        - 승용차:트럭 = 5:5 (1:1) 균등 비율로 변경
+          (7:3 비율은 데이터 불균형을 유발하여 모델 편향 원인)
     """
     bp_lib = world.get_blueprint_library()
     spawn_points = world.get_map().get_spawn_points()
     random.shuffle(spawn_points)
 
-    # 4륜 유효 차량만 필터링 (이륜차 / 트레일러 제외)
-    valid_bps = [b for b in bp_lib.filter("vehicle.*") if is_valid_vehicle(b.id)]
-    truck_bps = [b for b in valid_bps if is_truck(b.id)]
-    car_bps   = [b for b in valid_bps if not is_truck(b.id)]
+    # base_type 속성 기반 필터링 (motorcycle / bicycle / trailer 제외)
+    valid_bps = [b for b in bp_lib.filter("vehicle.*") if is_valid_vehicle_bp(b)]
+    truck_bps = [b for b in valid_bps if is_truck_bp(b)]
+    car_bps   = [b for b in valid_bps if not is_truck_bp(b)]
 
-    print(f"[DataCollector] 유효 차량 블루프린트 — car: {len(car_bps)}종  truck: {len(truck_bps)}종")
+    print(
+        f"[DataCollector] 유효 블루프린트 — car: {len(car_bps)}종  "
+        f"truck: {len(truck_bps)}종  "
+        f"(motorcycle/bicycle/trailer 제외됨)"
+    )
 
     vehicles = []
     tm = client.get_trafficmanager(8000)
     tm.set_global_distance_to_leading_vehicle(2.0)
 
     for sp in spawn_points[:num]:
-        # 승용차:트럭 = 7:3 비율
-        if random.random() < 0.3 and truck_bps:
+        # 승용차:트럭 = 5:5 (1:1) — 균형 데이터셋 수집 목적
+        if random.random() < 0.5 and truck_bps:
             bp = random.choice(truck_bps)
         elif car_bps:
             bp = random.choice(car_bps)
@@ -329,7 +401,12 @@ def spawn_npc_vehicles(client, world, num=NUM_NPC):
             actor.set_autopilot(True, tm.get_port())
             vehicles.append(actor)
 
-    print(f"[DataCollector] NPC 차량 {len(vehicles)}대 생성 (목표 {num}대)")
+    truck_count = sum(1 for v in vehicles if is_truck_actor(v))
+    car_count   = len(vehicles) - truck_count
+    print(
+        f"[DataCollector] NPC 차량 {len(vehicles)}대 생성 (목표 {num}대) "
+        f"— car: {car_count}대  truck: {truck_count}대"
+    )
     return vehicles
 
 
@@ -469,15 +546,18 @@ def get_vehicle_bbox_pixels(vehicle, camera_actor, K, img_w, img_h):
 # =============================================
 # 실시간 디버그 화면 렌더링
 # =============================================
-def draw_debug_overlay(img_bgr, detections, frame_idx, saved_car, saved_truck):
+def draw_debug_overlay(img_bgr, detections, frame_idx,
+                       saved_car, saved_truck, weather_name: str = ""):
     """
-    CARLA 카메라 프레임 위에 Ground Truth BBox + 라벨 오버레이
+    CARLA 카메라 프레임 위에 Ground Truth BBox + 라벨 + 수집 진행률 오버레이
 
     Args:
-        img_bgr   : 원본 BGR 이미지
-        detections: [(label, bbox, vehicle_id), ...] 리스트
-        frame_idx : 현재 프레임 번호
-        saved_car, saved_truck: 누적 저장 수
+        img_bgr      : 원본 BGR 이미지
+        detections   : [(label, bbox, vehicle_id), ...] 리스트
+        frame_idx    : 현재 프레임 번호
+        saved_car    : 누적 car 저장 수
+        saved_truck  : 누적 truck 저장 수
+        weather_name : 현재 날씨 프리셋 이름 (표시용)
 
     Returns:
         display: 오버레이가 그려진 이미지
@@ -498,18 +578,50 @@ def draw_debug_overlay(img_bgr, detections, frame_idx, saved_car, saved_truck):
         cv2.putText(display, text, (x + 2, y - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-    # 상단 정보 패널
-    panel_h = 60
+    # ── 상단 정보 패널 (높이 확장: 60 → 95) ──
+    panel_h = 95
     overlay = display.copy()
     cv2.rectangle(overlay, (0, 0), (display.shape[1], panel_h), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
 
-    info = (f"Frame: {frame_idx}  |  "
-            f"Detected: {len(detections)}  |  "
-            f"Saved - Car: {saved_car}  Truck: {saved_truck}  |  "
-            f"NPC: {NUM_NPC}  |  [Q] Quit")
-    cv2.putText(display, info, (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    # 기본 정보 텍스트 (날씨 이름 포함)
+    weather_label = weather_name if weather_name else "-"
+    info = (f"Frame: {frame_idx}  |  Detected: {len(detections)}  |  "
+            f"Weather: {weather_label}  |  NPC: {NUM_NPC}  |  [Q] Quit")
+    cv2.putText(display, info, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    # ── 수집 진행률 프로그레스 바 ──
+    bar_w     = 300          # 프로그레스 바 최대 너비
+    bar_h     = 14           # 프로그레스 바 높이
+    bar_x     = 10           # 시작 X
+    bar_y_car   = 45         # Car 바 Y
+    bar_y_truck = 68         # Truck 바 Y
+
+    car_ratio   = min(saved_car   / TARGET_PER_CLASS, 1.0)
+    truck_ratio = min(saved_truck / TARGET_PER_CLASS, 1.0)
+
+    # Car 프로그레스 바
+    cv2.rectangle(display, (bar_x, bar_y_car),
+                  (bar_x + bar_w, bar_y_car + bar_h), (60, 60, 60), -1)
+    cv2.rectangle(display, (bar_x, bar_y_car),
+                  (bar_x + int(bar_w * car_ratio), bar_y_car + bar_h),
+                  COLOR_CAR, -1)
+    cv2.putText(display,
+                f"Car  : {saved_car:>5}/{TARGET_PER_CLASS} ({car_ratio*100:5.1f}%)",
+                (bar_x + bar_w + 10, bar_y_car + bar_h - 1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_CAR, 1)
+
+    # Truck 프로그레스 바
+    cv2.rectangle(display, (bar_x, bar_y_truck),
+                  (bar_x + bar_w, bar_y_truck + bar_h), (60, 60, 60), -1)
+    cv2.rectangle(display, (bar_x, bar_y_truck),
+                  (bar_x + int(bar_w * truck_ratio), bar_y_truck + bar_h),
+                  COLOR_TRUCK, -1)
+    cv2.putText(display,
+                f"Truck: {saved_truck:>5}/{TARGET_PER_CLASS} ({truck_ratio*100:5.1f}%)",
+                (bar_x + bar_w + 10, bar_y_truck + bar_h - 1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_TRUCK, 1)
 
     return display
 
@@ -521,9 +633,15 @@ def collect_dataset(world, camera, img_queue, vehicles):
     """
     Ground Truth 기반 차량 이미지 자동 캡처 + 화면 디버그 뷰
 
-    변경사항:
-        - is_valid_vehicle() 체크 추가 → 이륜차/trailer 건너뜀
-        - MAX_BBOX_PX 확대 → 트럭 전체가 한 장에 저장
+    수정사항:
+        - base_type 속성 기반 이륜차 필터링으로 교체
+          (키워드 방식 누락 문제 완전 해결)
+        - 클래스별 수집 캡(TARGET_PER_CLASS) 적용
+          → car / truck 각각 목표 수량 도달 시 해당 클래스 캡처 중단
+          → 양쪽 모두 목표 달성 시 시뮬레이션 자동 종료
+        - 날씨 로테이션 추가 (WEATHER_CHANGE_INTERVAL 프레임마다 순환)
+          → WEATHER_PRESETS 7가지를 순서대로 적용
+          → 단일 환경 과적합 방지 및 데이터 다양성 확보
     """
     K = build_projection_matrix(IMG_WIDTH, IMG_HEIGHT, FOV)
 
@@ -534,10 +652,18 @@ def collect_dataset(world, camera, img_queue, vehicles):
     saved_truck = 0
     frame_idx   = 0
 
+    # ── 날씨 로테이션 초기화 ──
+    weather_idx     = 0
+    current_weather = WEATHER_PRESETS[0]
+    set_weather(world, current_weather)   # 첫 번째 날씨 즉시 적용
+
     cv2.namedWindow("CARLA DataCollector - CCTV View", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("CARLA DataCollector - CCTV View", 1280, 720)
 
-    print(f"[DataCollector] 데이터 수집 시작 ({SIM_DURATION}초) — [Q]키로 종료")
+    print(
+        f"[DataCollector] 데이터 수집 시작 ({SIM_DURATION}초) — [Q]키로 종료\n"
+        f"  날씨 로테이션: {len(WEATHER_PRESETS)}종 × {WEATHER_CHANGE_INTERVAL}프레임 주기"
+    )
     start_time = time.time()
 
     try:
@@ -560,6 +686,14 @@ def collect_dataset(world, camera, img_queue, vehicles):
                 raw_path = os.path.join(RAW_DIR, f"frame_{frame_idx:06d}.jpg")
                 cv2.imwrite(raw_path, frame_bgr)
 
+            # ── 날씨 로테이션 체크 ──
+            # frame_idx 기준으로 WEATHER_CHANGE_INTERVAL마다 다음 날씨로 순환
+            new_weather_idx = (frame_idx // WEATHER_CHANGE_INTERVAL) % len(WEATHER_PRESETS)
+            if new_weather_idx != weather_idx:
+                weather_idx     = new_weather_idx
+                current_weather = WEATHER_PRESETS[weather_idx]
+                set_weather(world, current_weather)
+
             # 현재 월드의 모든 차량 가져오기
             actor_list = world.get_actors().filter("vehicle.*")
             now = time.time()
@@ -569,18 +703,19 @@ def collect_dataset(world, camera, img_queue, vehicles):
             cam_loc = camera.get_location()   # 가시성 체크용 카메라 위치
 
             for vehicle in actor_list:
-                vid   = vehicle.id
-                bp_id = vehicle.type_id
+                vid = vehicle.id
 
-                # ── 이륜차 / trailer 제외 (나무처럼 보이는 샘플 & 트럭 분할 방지) ──
-                if not is_valid_vehicle(bp_id):
+                # ── base_type 속성으로 이륜차 / trailer 제외 ──
+                # 기존 키워드 방식은 CARLA 신규 블루프린트(예: 새 오토바이 모델)를
+                # 누락할 수 있으므로 base_type 속성을 직접 사용
+                if not is_valid_vehicle_actor(vehicle):
                     continue
 
                 # ── 벽/건물에 가려진 차량 제외 (cast_ray 가시성 체크) ──
                 if not is_vehicle_visible(world, cam_loc, vehicle):
                     continue
 
-                label = get_vehicle_label(bp_id)
+                label = "truck" if is_truck_actor(vehicle) else "car"
 
                 # 3D BBox → 2D 픽셀 BBox
                 bbox = get_vehicle_bbox_pixels(vehicle, camera, K,
@@ -589,6 +724,13 @@ def collect_dataset(world, camera, img_queue, vehicles):
                     continue
 
                 detections.append((label, bbox, vid))
+
+                # ── 클래스 캡(Cap) 체크 ──
+                # 해당 클래스가 목표 수량에 도달하면 더 이상 저장하지 않음
+                if label == "car"   and saved_car   >= TARGET_PER_CLASS:
+                    continue
+                if label == "truck" and saved_truck >= TARGET_PER_CLASS:
+                    continue
 
                 # 쿨다운 체크 (같은 차량 중복 캡처 방지)
                 if now - last_capture.get(vid, 0) < CAPTURE_COOLDOWN:
@@ -611,9 +753,18 @@ def collect_dataset(world, camera, img_queue, vehicles):
                 else:
                     saved_truck += 1
 
+            # ── 양쪽 클래스 모두 목표 도달 시 자동 종료 ──
+            if saved_car >= TARGET_PER_CLASS and saved_truck >= TARGET_PER_CLASS:
+                print(
+                    f"\n[DataCollector] ✓ 목표 수집량 달성! 자동 종료합니다.\n"
+                    f"  car: {saved_car}장  truck: {saved_truck}장 (목표: {TARGET_PER_CLASS}장)"
+                )
+                break
+
             # 디버그 오버레이 화면 표시
             display = draw_debug_overlay(frame_bgr, detections,
-                                         frame_idx, saved_car, saved_truck)
+                                         frame_idx, saved_car, saved_truck,
+                                         current_weather)
             cv2.imshow("CARLA DataCollector - CCTV View", display)
 
             frame_idx += 1
@@ -626,9 +777,14 @@ def collect_dataset(world, camera, img_queue, vehicles):
             # 진행 상황 5초마다 출력
             if frame_idx % 50 == 0:
                 elapsed = time.time() - start_time
-                print(f"[DataCollector] {elapsed:.0f}s | "
-                      f"Frame {frame_idx} | "
-                      f"Car: {saved_car}  Truck: {saved_truck}")
+                car_pct   = min(saved_car   / TARGET_PER_CLASS * 100, 100)
+                truck_pct = min(saved_truck / TARGET_PER_CLASS * 100, 100)
+                print(
+                    f"[DataCollector] {elapsed:.0f}s | Frame {frame_idx} | "
+                    f"Weather: {current_weather} | "
+                    f"Car: {saved_car}/{TARGET_PER_CLASS} ({car_pct:.1f}%)  "
+                    f"Truck: {saved_truck}/{TARGET_PER_CLASS} ({truck_pct:.1f}%)"
+                )
 
     finally:
         cv2.destroyAllWindows()
@@ -656,9 +812,8 @@ def main():
     intersection_loc = find_intersection(world)
     camera, img_queue = spawn_cctv_camera(world, intersection_loc)
 
-    # 날씨 랜덤 선택 (다양한 데이터 확보)
-    weather = random.choice(["clear", "clear", "cloudy", "rain"])
-    set_weather(world, weather)
+    # 날씨는 collect_dataset() 내부에서 WEATHER_PRESETS 순서대로 자동 로테이션
+    # (기존 단일 랜덤 선택 제거 → 다양성 자동 확보)
 
     vehicles = spawn_npc_vehicles(client, world, num=NUM_NPC)
 

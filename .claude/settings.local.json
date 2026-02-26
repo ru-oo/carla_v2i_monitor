@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add requirements.txt src/data_collector.py)",
+      "Bash(git commit:*)",
+      "Bash(git add src/data_collector.py)",
+      "Bash(~/miniconda3/Scripts/conda.exe info --envs)",
+      "Bash(~/miniconda3/envs/dl/python.exe --version)",
+      "Bash(~/miniconda3/envs/ai_project/python.exe --version)",
+      "Bash(for env in dl ai_project test)",
+      "Bash(do echo \"[$env]\")",
+      "Bash(~/miniconda3/envs/$env/python.exe --version)",
+      "Bash(done)",
+      "Bash(~/miniconda3/envs/dl/python.exe -m pip list)",
+      "Bash(~/miniconda3/envs/dl/python.exe -c \":*)"
+    ]
+  }
+}
