@@ -183,6 +183,33 @@ python src/youtube_cctv_monitor.py --webcam 0
 
 ---
 
+## 트러블슈팅
+
+### BEV 좌표/스케일 정합
+
+**증상** — BEV(조감) 영상이 왜곡되거나 좌우·상하가 반전되고, IPM 레이더 좌표가 실제 미터 스케일과 어긋남.
+
+**원인**
+
+1. **CARLA UE4 좌표계 ↔ 카메라/이미지 축 매핑** — CARLA는 left-handed(UE4) 좌표계(forward=x, right=y, up=z)를 씁니다. `src/main_system.py`의 `world_to_pixel()`과 `src/data_collector.py`의 `world_to_pixel()`은 카메라 좌표를 이미지 축으로 `x_img = y_cam`, `y_img = -z_cam`(상하 부호 반전), `z_img = x_cam`(깊이)로 변환하고 `z_img <= 0`(카메라 뒤)이면 `None`을 반환합니다. `compute_bev()`도 같은 규약(`x_img = pts_cam[:,1]`, `y_img = -pts_cam[:,2]`, `z_dep = pts_cam[:,0]`)을 따릅니다. 이 축·부호 변환이 어긋나면 BEV가 반전·왜곡됩니다.
+2. **IPM 4점을 임의로 찍어 지면 사각형이 안 맞던 문제** — `src/vision_processor.py`의 `IPM_SRC_POINTS`는 임의 점이 아니라, 주석에 기록된 대로 지면 직사각형(카메라 전방 6~28m, 좌우 ±6m = 22m×12m)의 코너를 카메라 투영으로 역산한 이미지 좌표 `FL(552,346) · FR(728,346) · NR(896,716) · NL(384,716)`로 지정돼 있습니다.
+
+**해결** (코드/주석에서 확인되는 범위)
+
+- **IPM 4점 역산** — 위 지면 직사각형 코너의 카메라 투영 좌표로 `IPM_SRC_POINTS`를 정의하고, `IPM_DST_POINTS`(400×400)와 함께 `cv2.getPerspectiveTransform`으로 IPM 행렬을 만듭니다(`VisionProcessor.__init__`). `_pixel_to_world()`는 BBox bottom-center(지면 접촉점)를 IPM 투영한 뒤 `PIXELS_PER_METER`로 나눠 미터 좌표를 산출합니다.
+- **BEV 역투영** — `compute_bev()`는 각 BEV 픽셀 → 지면 평면(z=junc_z) 월드 좌표 → 카메라 투영(`cam_inv @ pts_world`)으로 원본 프레임 색을 샘플링하는 정사영(inverse warping) 방식이며, North-up(`v=0`→North, East=+X, South=+Y) 그리드로 구성됩니다.
+- **Open3D 미러 보정** — `main_system.py`에서 Open3D 캡처 화면에 `cv2.flip(bgr, 1)`을 적용합니다(주석: "좌우 미러 보정: Open3D에서 East(+X)가 왼쪽으로 나오는 현상 수정").
+
+> **★ PIXELS_PER_METER 값 정합 — 확인 필요**
+> 미터 환산 상수가 파일마다 다릅니다.
+>
+> | 파일 | 심볼 | 값 | 비고 |
+> |------|------|----|------|
+> | `src/vision_processor.py` | `PIXELS_PER_METER` | **18.18** | 주석: 400px / 22m (geometry 기반 재계산), `_pixel_to_world`에서 사용 |
+> | `src/youtube_cctv_monitor.py` | `RadarRenderer._PPM` | **14.0** | 주석에는 "VisionProcessor.PIXELS_PER_METER 와 동기화"라고 적혀 있으나 값이 다름 |
+>
+> 동일한 IPM 출력(400px)을 미터로 환산할 때 두 값(18.18 vs 14.0)이 불일치하면 레이더 스케일이 어긋납니다. 어느 값이 옳은지는 단정하지 말고 **값 정합 확인 필요**.
+
 ## 디렉터리 구조
 
 ```
