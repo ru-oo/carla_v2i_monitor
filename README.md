@@ -8,6 +8,8 @@ YOLO 없이 **고전 컴퓨터 비전(MOG2 · IPM)** 과 **경량 CNN** 만으�
 
 ## 데모
 
+![데모](picture/demo.gif)
+
 | 데이터 수집 (CARLA) | 실시간 비전 (MOG2) |
 |:---:|:---:|
 | ![데이터 수집](picture/datacollect.png) | ![MOG2](picture/MOG2.png) |
