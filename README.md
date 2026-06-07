@@ -200,16 +200,6 @@ python src/youtube_cctv_monitor.py --webcam 0
 - **BEV 역투영** — `compute_bev()`는 각 BEV 픽셀 → 지면 평면(z=junc_z) 월드 좌표 → 카메라 투영(`cam_inv @ pts_world`)으로 원본 프레임 색을 샘플링하는 정사영(inverse warping) 방식이며, North-up(`v=0`→North, East=+X, South=+Y) 그리드로 구성됩니다.
 - **Open3D 미러 보정** — `main_system.py`에서 Open3D 캡처 화면에 `cv2.flip(bgr, 1)`을 적용합니다(주석: "좌우 미러 보정: Open3D에서 East(+X)가 왼쪽으로 나오는 현상 수정").
 
-> **★ PIXELS_PER_METER 값 정합 — 확인 필요**
-> 미터 환산 상수가 파일마다 다릅니다.
->
-> | 파일 | 심볼 | 값 | 비고 |
-> |------|------|----|------|
-> | `src/vision_processor.py` | `PIXELS_PER_METER` | **18.18** | 주석: 400px / 22m (geometry 기반 재계산), `_pixel_to_world`에서 사용 |
-> | `src/youtube_cctv_monitor.py` | `RadarRenderer._PPM` | **14.0** | 주석에는 "VisionProcessor.PIXELS_PER_METER 와 동기화"라고 적혀 있으나 값이 다름 |
->
-> 동일한 IPM 출력(400px)을 미터로 환산할 때 두 값(18.18 vs 14.0)이 불일치하면 레이더 스케일이 어긋납니다. 어느 값이 옳은지는 단정하지 말고 **값 정합 확인 필요**.
-
 ## 디렉터리 구조
 
 ```
