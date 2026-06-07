@@ -6,7 +6,7 @@ main_system.py
 
 역할:
     - CARLA V2I 스마트 교차로 3D 관제 시스템 메인 루프
-    - 항공 조감 CCTV (50m 수직 + 교차로 전체 시야)
+    - 교차로 코너 CCTV (14m 높이 / 20m 오프셋 / pitch≈-35°)
     - Occlusion Culling (cast_ray) 로 건물 뒤 차량 필터링
     - Open3D 3D V2I 레이더 맵 (Tesla 계기판 스타일)
     - VisionProcessor (MOG2 + CentroidTracker) 디버그 패널
@@ -30,8 +30,10 @@ import cv2
 import numpy as np
 import open3d as o3d
 
+from collections import deque, Counter
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from classifier import CLASSES, VehicleClassifier
+from classifier import CLASSES, VehicleClassifier, LinearVehicleClassifier
 from vision_processor import VisionProcessor
 
 
@@ -44,18 +46,41 @@ TM_PORT    = 9000
 
 IMG_W      = 1280
 IMG_H      = 720
-CAM_FOV    = 90.0       # 넓은 FOV → 교차로 전체 포착
-CAM_HEIGHT = 50.0       # 항공 조감 높이 (m) — 교차로 전체 보임
+CAM_FOV       = 110.0   # CCTV 화각
+CAM_HEIGHT    = 12.0     # CCTV 폴 높이 (실제 코너 폴: 7m)
+CAM_OFFSET    = 22.0    # 교차로 중심에서 오프셋 (줄임: 22→10 → 도로 경계 바로 바깥)
+                         # off=10/√2≈7.07m → cx=-35.8, cy=35.2 (도로 SW 경계 약 1.4m 바깥)
+CAM_PITCH_DEG = -25.0   # 도로를 향해 내려다봄 → 교차로 70% 위치에 보임
+                         # 계산: atan(7/10)=35° 아래, pitch=-20° → axis에서 15° 아래 = 70%
+CAM_YAW_OFFSET = -50.0    # 오프셋 없음: SW→NE 대각선 yaw=−45°
+
+# 디스플레이 창 크기 (CCTV + 우측 패널)
+DISP_W     = 1900       # 전체 창 너비 (CCTV 1280 + 우측 620)
+DISP_H     = 720        # 전체 창 높이
+
+# BEV 설정
+BEV_PX     = 350        # BEV 이미지 크기 (정방형 px)
+BEV_RANGE  = 50.0       # BEV 커버 범위 (m): 교차로 ±25m
 NUM_NPC    = 40
 
 MAP_PX     = 500        # Open3D 레이더 캔버스 크기
 
-CLASSIFY_INTERVAL      = 5
+CLASSIFY_INTERVAL      = 3     # N프레임마다 재분류 (빠른 투표 반응)
 MIN_BBOX_PX            = 8    # 항공뷰: 작은 BBox도 유효
 RADAR_UPDATE_INTERVAL  = 6    # Open3D 갱신 주기 (프레임)
 OCCLUSION_CACHE_FRAMES = 10
 MAX_DETECTION_DIST     = 90.0
-VISION_UPDATE_INTERVAL = 3
+VISION_UPDATE_INTERVAL = 1    # VisionProcessor 매 프레임 실행 (속도 추정용)
+
+# ── 라벨 안정화 ──────────────────────────────────────────────
+VOTE_WINDOW    = 7     # 다수결 최근 N프레임
+CONF_THRESHOLD = 0.55  # 신뢰도 미달 → 투표 불참
+MIN_BBOX_CLS   = 20    # 이 픽셀 이하 BBox는 분류 생략
+
+# ── 속도 추정 보정 ───────────────────────────────────────────
+MIN_DISP_METER  = 0.30  # IPM 좌표 최소 변위 미만 → 정지 처리
+SPEED_EMA_ALPHA = 0.15  # EMA 계수 (낮을수록 부드러움)
+SPEED_CAP_KMH   = 80.0  # 속도 상한
 
 _3D_ROAD_LEN = 55.0    # 도로 암 길이 (m)
 
@@ -72,9 +97,9 @@ ICON = {"bus": "B", "car": "C", "truck": "T", "van": "V", "unknown": "?"}
 # ─── Open3D용 RGB [0,1] ────
 _O3D_RGB = {
     "bus":     (1.00, 0.55, 0.00),
-    "car":     (0.00, 0.82, 0.24),
-    "truck":   (0.20, 0.20, 1.00),
-    "van":     (1.00, 0.71, 0.00),
+    "car":     (0.24, 0.82, 0.00),
+    "truck":   (1.00, 0.20, 0.20),
+    "van":     (0.00, 0.71, 1.00),
     "unknown": (0.59, 0.59, 0.59),
 }
 _HEX = {
@@ -171,6 +196,103 @@ def get_road_half_width(world, junction_center, default=6.5):
 
 
 # =============================================
+# BEV (Bird's Eye View) 정사영 생성
+# =============================================
+def compute_bev(frame: np.ndarray,
+                cam_inv: np.ndarray,
+                K: np.ndarray,
+                junc_x: float, junc_y: float, junc_z: float,
+                bev_px: int   = BEV_PX,
+                bev_range: float = BEV_RANGE) -> np.ndarray:
+    """
+    카메라 프레임 → BEV (North-up, 정사영법).
+
+    각 BEV 픽셀에 대응하는 CARLA 지면 좌표를 계산하고,
+    CARLA 카메라 투영으로 원본 이미지에서 색상을 샘플링.
+
+    Args:
+        frame    : BGR 카메라 이미지 (H×W×3)
+        cam_inv  : CARLA 카메라 역변환 행렬 (4×4)
+        K        : 카메라 내재 행렬 (3×3)
+        junc_x/y/z: 교차로 중심 CARLA 월드 좌표
+        bev_px   : 출력 BEV 크기 (정방형)
+        bev_range: 커버할 범위 (m)  교차로 중심 ±bev_range/2
+
+    Returns:
+        BEV 이미지 (bev_px×bev_px×3, North-up)
+    """
+    h_img, w_img = frame.shape[:2]
+    scale = bev_range / bev_px           # m/pixel
+
+    # BEV 그리드: v=row(0=North), u=col(0=West)
+    v_idx, u_idx = np.mgrid[0:bev_px, 0:bev_px]
+
+    # BEV 픽셀 → CARLA 월드 좌표 (지면 평면 z=junc_z)
+    wx = junc_x + (u_idx.ravel() - bev_px / 2.0) * scale   # East  = +X
+    wy = junc_y + (v_idx.ravel() - bev_px / 2.0) * scale   # South = +Y (v=0→North)
+    wz = np.full(bev_px * bev_px, junc_z)
+
+    # CARLA 카메라 투영:  cam_inv @ [wx, wy, wz, 1]ᵀ
+    ones      = np.ones(bev_px * bev_px)
+    pts_world = np.stack([wx, wy, wz, ones], axis=1)   # (N,4)
+    pts_cam   = (cam_inv @ pts_world.T).T               # (N,4)
+
+    # CARLA 카메라 좌표: X=forward, Y=right, Z=up
+    x_img = pts_cam[:, 1]
+    y_img = -pts_cam[:, 2]
+    z_dep = pts_cam[:, 0]
+
+    valid = z_dep > 0.1
+    safe_z = np.where(valid, z_dep, 1.0)
+    px = (K[0, 0] * x_img / safe_z + K[0, 2]).astype(np.int32)
+    py = (K[1, 1] * y_img / safe_z + K[1, 2]).astype(np.int32)
+
+    in_bounds = valid & (px >= 0) & (px < w_img) & (py >= 0) & (py < h_img)
+
+    bev_img = np.full((bev_px, bev_px, 3), 18, dtype=np.uint8)
+    bev_img[v_idx.ravel()[in_bounds], u_idx.ravel()[in_bounds]] = \
+        frame[py[in_bounds], px[in_bounds]]
+    return bev_img
+
+
+def draw_bev_overlay(bev_img: np.ndarray, road_hw: float) -> np.ndarray:
+    """BEV 이미지에 도로 경계·거리 원호·방향 표시 오버레이."""
+    h, w  = bev_img.shape[:2]
+    out   = bev_img.copy()
+    scale = BEV_RANGE / BEV_PX          # m/pixel
+    cx, cy = w // 2, h // 2
+
+    # 거리 원호
+    for r_m in [10, 20, 25]:
+        r_px = int(r_m / scale)
+        cv2.circle(out, (cx, cy), r_px, (50, 72, 95), 1, cv2.LINE_AA)
+        cv2.putText(out, f"{r_m}m", (cx + r_px + 2, cy - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (50, 72, 95), 1)
+
+    # 도로 경계선 (측정 반폭)
+    hw_px = max(1, int(road_hw / scale))
+    col   = (80, 105, 130)
+    cv2.line(out, (cx - hw_px, 0),  (cx - hw_px, h), col, 1)
+    cv2.line(out, (cx + hw_px, 0),  (cx + hw_px, h), col, 1)
+    cv2.line(out, (0, cy - hw_px),  (w, cy - hw_px), col, 1)
+    cv2.line(out, (0, cy + hw_px),  (w, cy + hw_px), col, 1)
+
+    # 교차로 중심 마커
+    cv2.circle(out, (cx, cy), 5, (0, 200, 255), -1)
+
+    # 방향 레이블
+    cv2.putText(out, "N", (cx - 5, 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 1)
+    cv2.putText(out, "S", (cx - 5, h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 1)
+    cv2.putText(out, "E", (w - 14, cy + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 1)
+    cv2.putText(out, "W", (2, cy + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 1)
+    return out
+
+
+# =============================================
 # 교차로 탐색
 # =============================================
 def find_intersection(world):
@@ -192,12 +314,22 @@ def find_intersection(world):
 
 
 # =============================================
-# 항공 CCTV 카메라 설치 (교차로 바로 위)
+# CCTV 카메라 설치 (NW 코너 — 최적 위치 자동 선정)
 # =============================================
 def spawn_cctv_camera(world, junc_center):
     """
-    교차로 중심 정 상공 CAM_HEIGHT(50m)에 카메라 설치.
-    pitch=-89°로 거의 수직 내려다보기 → 교차로 전체가 한 눈에 보임.
+    교차로 NW 코너에서 SE(교차로 방향)를 바라보는 CCTV 설치.
+
+    cctv_optimizer.py 자동 평가 결과 (Town10HD_Opt, NPC 40대):
+        #1 NW corner  avg_visible=25.0  score=28.85  ← 채택
+        #2 SW corner  avg_visible=20.5  score=24.29
+        #8 South road avg_visible=15.7  score=19.63  (이전 위치)
+
+    • 위치: 교차로 중심에서 NW 방향 (−X, −Y 각 CAM_OFFSET/√2 m)
+    • 시선: SE(yaw=+45°), pitch ≈ −24°
+    • FOV : 110° → North arm(좌상) + West arm(우하) + 교차로 전체 포착
+    • 이유: 대각선 뷰로 2개 도로 암 + 교차로 전체가 시야에 들어와
+            차량 인식 수가 South road 대비 약 60% 향상 (25.0 vs 15.7대)
     """
     bp_lib = world.get_blueprint_library()
     cam_bp = bp_lib.find("sensor.camera.rgb")
@@ -205,12 +337,21 @@ def spawn_cctv_camera(world, junc_center):
     cam_bp.set_attribute("image_size_y", str(IMG_H))
     cam_bp.set_attribute("fov", str(CAM_FOV))
 
-    cx = junc_center.x
-    cy = junc_center.y
-    cz = junc_center.z + CAM_HEIGHT   # 정 상공
+    # SW 코너 위치 (좌측하단): −X(서쪽), +Y(남쪽)
+    # 화면 기준: 좌하단 위치 → 우상단(NE) 방향을 바라봄
+    off = CAM_OFFSET / math.sqrt(2)
+    cx  = junc_center.x - off          # 서쪽(−X)
+    cy  = junc_center.y + off          # 남쪽(+Y) ← NW에서 SW로 변경
+    cz  = junc_center.z + CAM_HEIGHT
 
-    pitch = -89.0   # 거의 수직 내려다보기 (짐벌 락 방지)
-    yaw   = -90.0   # 북쪽을 화면 위로 → 지도 방향과 일치
+    # 수평 방향: SW → 교차로 중심(NE, yaw≈−45°) + 선택적 오프셋
+    dx    = junc_center.x - cx         # +off (+X = East)
+    dy    = junc_center.y - cy         # −off (−Y = North)
+    yaw   = math.degrees(math.atan2(dy, dx)) + CAM_YAW_OFFSET  # ≈ −45° (NE)
+
+    # 수직 방향: 살짝 위를 바라봄 → 교차로가 화면 하단에 위치
+    # CAM_PITCH_DEG > 0: 교차로가 아래로 내려감 (화면 하단 90% 목표)
+    pitch = CAM_PITCH_DEG
 
     cam_tf = carla.Transform(
         carla.Location(x=cx, y=cy, z=cz),
@@ -221,9 +362,8 @@ def spawn_cctv_camera(world, junc_center):
     camera = world.spawn_actor(cam_bp, cam_tf)
     camera.listen(lambda img: img_q.put_nowait(img) if not img_q.full() else None)
 
-    # 화면 중심에서 보이는 지면 범위 ≈ 2 * 50 * tan(45°) = 100m
-    print(f"[V2I] 항공 CCTV  ({cx:.1f}, {cy:.1f}, {cz:.1f}m)  "
-          f"pitch={pitch}°  yaw={yaw}°  시야≈100m")
+    print(f"[V2I] CCTV 설치  위치=({cx:.1f}, {cy:.1f}, {cz:.1f}m)  "
+          f"pitch={pitch:.1f}°  yaw={yaw:.1f}°  FOV={CAM_FOV}°")
     return camera, img_q, cam_tf
 
 
@@ -296,7 +436,7 @@ class V2IMapRenderer:
         opt.background_color = np.array([0.04, 0.047, 0.071])  # Tesla 어두운 배경
         opt.point_size       = 4.0
         opt.line_width       = 2.5
-        opt.light_on         = False    # Unlit 렌더 → 색상 그대로 표현
+        # light_on 기본값(True) 유지 — False 시 메쉬 색상이 검정으로 렌더됨
 
         # 정적 장면 구축
         self._static_geoms: list = []
@@ -320,6 +460,7 @@ class V2IMapRenderer:
     # ── 좌표 변환 ──────────────────────────────────────────────
     def _c(self, cx, cy, cz=0.0):
         """CARLA world → 장면 로컬 좌표 (교차로 중심, Y=South 유지)"""
+        MAP_OFFSET_X = -18.0
         return (float(cx - self.junc.x),
                 float(cy - self.junc.y),
                 float(cz - self.junc.z))
@@ -353,100 +494,92 @@ class V2IMapRenderer:
             self._dyn_geoms.append(geom)
 
     def _build_static_scene(self):
-        hw = self.road_hw
-        ln = _3D_ROAD_LEN
+            hw = self.road_hw * 1.5
+            ln = _3D_ROAD_LEN
+            
+            MAP_OFFSET_X = -18.0
 
-        ROAD_COL   = [0.15, 0.17, 0.21]
-        GROUND_COL = [0.04, 0.047, 0.071]
-        ARC_COL    = [0.11, 0.15, 0.22]
-        LANE_COL   = [0.24, 0.28, 0.37]
-        CCTV_COL   = [0.0,  0.82, 0.54]
-        CENTER_COL = [0.0,  0.78, 1.0 ]
+            ROAD_COL   = [0.38, 0.43, 0.54]
+            GROUND_COL = [0.04, 0.047, 0.071]
+            ARC_COL    = [0.22, 0.28, 0.40]
+            LANE_COL   = [0.50, 0.56, 0.68]
+            CCTV_COL   = [0.0,  0.82, 0.54]
+            CENTER_COL = [0.0,  0.78, 1.0 ]
 
-        # 지면
-        gnd = self._flat_rect(-65, -65, 65, 65, z=0.0, thick=0.05)
-        self._add(gnd, GROUND_COL)
+            gnd = self._flat_rect(-65, -65, 65, 65, z=0.0, thick=0.05)
+            gnd.translate([MAP_OFFSET_X, 0, 0])
+            self._add(gnd, GROUND_COL)
 
-        # 도로 암 (North=-Y, South=+Y, East=+X, West=-X)
-        road_segs = [
-            (-hw, -ln, hw,  0),    # 북 (−Y 방향)
-            (-hw,  0,  hw, ln),    # 남 (+Y 방향)
-            ( 0, -hw, ln,  hw),    # 동 (+X 방향)
-            (-ln, -hw,  0, hw),    # 서 (−X 방향)
-            (-hw, -hw, hw, hw),    # 교차로 중앙
-        ]
-        for i, (x1,y1,x2,y2) in enumerate(road_segs):
-            r = self._flat_rect(x1, y1, x2, y2, z=0.01, thick=0.06)
-            self._add(r, ROAD_COL)
+            road_segs = [
+                        (-hw, -2*ln, hw,  0),      # 북
+                        (-hw,  0,  hw, ln),      # 남
+                        ( 0, -3*hw, ln,  hw),    # 동 (화면 위쪽으로 폭 확장)
+                        (-ln, -3*hw,  0, hw),    # 서 (화면 위쪽으로 폭 확장)
+                        (-hw, -3*hw, hw, hw),    # 교차로 중앙 (위쪽 빈 공간 채움)
+                    ]
+            for i, (x1,y1,x2,y2) in enumerate(road_segs):
+                r = self._flat_rect(x1, y1, x2, y2, z=0.01, thick=0.06)
+                r.translate([MAP_OFFSET_X, 0, 0])
+                self._add(r, ROAD_COL)
 
-        # 차선 중앙선 (LineSet)
-        lane_pts, lane_lines, lane_cols = [], [], []
-        seg, gap = 2.2, 1.4
-        for ddx, ddy in ((0,-1),(0,1),(1,0),(-1,0)):
-            k = 1
-            while True:
-                t0 = k*(seg+gap) - seg
-                t1 = t0 + seg
-                if t1 > ln: break
-                i0 = len(lane_pts)
-                lane_pts += [[ddx*t0, ddy*t0, 0.03], [ddx*t1, ddy*t1, 0.03]]
-                lane_lines.append([i0, i0+1])
-                lane_cols.append(LANE_COL)
-                k += 1
-        if lane_lines:
-            ls = o3d.geometry.LineSet()
-            ls.points = o3d.utility.Vector3dVector(lane_pts)
-            ls.lines  = o3d.utility.Vector2iVector(lane_lines)
-            ls.colors = o3d.utility.Vector3dVector(lane_cols)
-            self.vis.add_geometry(ls, reset_bounding_box=True)
-            self._static_geoms.append(ls)
+            lane_pts, lane_lines, lane_cols = [], [], []
+            seg, gap = 2.2, 1.4
+            for ddx, ddy in ((0,-1),(0,1),(1,0),(-1,0)):
+                k = 1
+                while True:
+                    t0 = k*(seg+gap) - seg
+                    t1 = t0 + seg
+                    if t1 > ln: break
+                    i0 = len(lane_pts)
+                    lane_pts += [[ddx*t0, ddy*t0, 0.03], [ddx*t1, ddy*t1, 0.03]]
+                    lane_lines.append([i0, i0+1])
+                    lane_cols.append(LANE_COL)
+                    k += 1
+            if lane_lines:
+                ls = o3d.geometry.LineSet()
+                ls.points = o3d.utility.Vector3dVector(lane_pts)
+                ls.lines  = o3d.utility.Vector2iVector(lane_lines)
+                ls.colors = o3d.utility.Vector3dVector(lane_cols)
+                ls.translate([MAP_OFFSET_X, 0, 0])
+                self.vis.add_geometry(ls, reset_bounding_box=True)
+                self._static_geoms.append(ls)
 
-        # 거리 원호 (10/20/30/40m)
-        for r_m in (10, 20, 30, 40):
-            n       = 72
-            thetas  = np.linspace(0, 2*np.pi, n, endpoint=False)
-            pts     = [[r_m*np.cos(t), r_m*np.sin(t), 0.04] for t in thetas]
-            lines   = [[i, (i+1)%n] for i in range(n)]
-            cols    = [ARC_COL] * n
-            ls = o3d.geometry.LineSet()
-            ls.points = o3d.utility.Vector3dVector(pts)
-            ls.lines  = o3d.utility.Vector2iVector(lines)
-            ls.colors = o3d.utility.Vector3dVector(cols)
-            self.vis.add_geometry(ls, reset_bounding_box=True)
-            self._static_geoms.append(ls)
+            for r_m in (10, 20, 30, 40):
+                n       = 72
+                thetas  = np.linspace(0, 2*np.pi, n, endpoint=False)
+                pts     = [[r_m*np.cos(t), r_m*np.sin(t), 0.04] for t in thetas]
+                lines   = [[i, (i+1)%n] for i in range(n)]
+                cols    = [ARC_COL] * n
+                ls = o3d.geometry.LineSet()
+                ls.points = o3d.utility.Vector3dVector(pts)
+                ls.lines  = o3d.utility.Vector2iVector(lines)
+                ls.colors = o3d.utility.Vector3dVector(cols)
+                ls.translate([MAP_OFFSET_X, 0, 0])
+                self.vis.add_geometry(ls, reset_bounding_box=True)
+                self._static_geoms.append(ls)
 
-        # 교차로 중심 마커 (작은 원기둥)
-        cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=0.8, height=0.6)
-        cyl.translate([0, 0, 0.3])
-        self._add(cyl, CENTER_COL)
+            cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=0.8, height=0.6)
+            cyl.translate([MAP_OFFSET_X, 0, 0.3])
+            self._add(cyl, CENTER_COL)
 
-        # CCTV 폴 (교차로 정 상공 → 세로 라인)
-        cx, cy, cz = self._c(self.cam_loc.x, self.cam_loc.y, self.cam_loc.z)
-        pole = o3d.geometry.LineSet()
-        pole.points = o3d.utility.Vector3dVector([[cx,cy,0],[cx,cy,cz]])
-        pole.lines  = o3d.utility.Vector2iVector([[0,1]])
-        pole.colors = o3d.utility.Vector3dVector([CCTV_COL])
-        self.vis.add_geometry(pole, reset_bounding_box=True)
-        self._static_geoms.append(pole)
+            cx, cy, cz = self._c(self.cam_loc.x, self.cam_loc.y, self.cam_loc.z)
+            pole = o3d.geometry.LineSet()
+            pole.points = o3d.utility.Vector3dVector([[cx,cy,0],[cx,cy,cz]])
+            pole.lines  = o3d.utility.Vector2iVector([[0,1]])
+            pole.colors = o3d.utility.Vector3dVector([CCTV_COL])
+            self.vis.add_geometry(pole, reset_bounding_box=True)
+            self._static_geoms.append(pole)
 
-        # CCTV 카메라 마커 (작은 구)
-        ball = o3d.geometry.TriangleMesh.create_sphere(radius=1.2)
-        ball.translate([cx, cy, cz])
-        self._add(ball, CCTV_COL)
+            ball = o3d.geometry.TriangleMesh.create_sphere(radius=1.2)
+            ball.translate([cx, cy, cz])
+            self._add(ball, CCTV_COL)
 
-    # ── 카메라 뷰 고정 (Tesla 계기판 느낌) ──────────────────────
     def _apply_camera(self):
-        """
-        교차로 남쪽 + 약간 동쪽, 높이 30m → 북서 방향 내려다봄
-        (CARLA Y=South → 남쪽에서 북쪽 방향으로 바라보는 Tesla 계기판 시점)
-        """
         ctr = self.vis.get_view_control()
-        ctr.set_lookat([0, 0, 0])
+        ctr.set_lookat([-15.6, -10.0, 0])
         ctr.set_up([0, 0, 1])
-        # front: 교차로를 향하는 방향 = 남쪽(+Y)과 위쪽(+Z)에서 바라봄
-        # 정면 벡터 = eye→target = 0-(10,40,28) normalize
-        ctr.set_front([-0.18, -0.78, -0.60])
-        ctr.set_zoom(0.28)
+        ctr.set_front([0, 0.906, 0.424])
+        ctr.set_zoom(0.30)
 
     # ── 동적 장면 정리 ────────────────────────────────────────
     def _clear_dynamic(self):
@@ -460,7 +593,9 @@ class V2IMapRenderer:
     # ── 차량 박스 생성 ────────────────────────────────────────
     def _make_vehicle_box(self, actor, vtype: str):
         loc = actor.get_location()
-        px, py, pz = self._c(loc.x, loc.y, loc.z)
+        # Z는 CARLA 월드좌표(차량 중심 높이)를 그대로 쓰면 도로면 위로 뜸
+        # → XY만 사용하고 Z는 항상 도로 표면(0.05m)에 고정
+        px, py, _ = self._c(loc.x, loc.y, loc.z)
 
         bb = actor.bounding_box
         hl, hw_v, hh = bb.extent.x, bb.extent.y, bb.extent.z
@@ -478,7 +613,7 @@ class V2IMapRenderer:
         colors_arr = np.zeros((len(verts), 3))
         for i, v in enumerate(verts):
             z_frac         = np.clip(v[2] / (hh*2), 0, 1)
-            brightness     = 0.22 + 0.78 * z_frac
+            brightness     = 0.35 + 0.65 * z_frac   # 하단도 밝게 → 도로 위 차량 선명
             colors_arr[i]  = np.clip(base * brightness, 0, 1)
         box.vertex_colors = o3d.utility.Vector3dVector(colors_arr)
         box.compute_vertex_normals()
@@ -486,23 +621,24 @@ class V2IMapRenderer:
         # Z축 회전 (CARLA yaw = Open3D Z rotation 동방향)
         R = self._rot_z(yaw_rad)
         box.rotate(R, center=[0, 0, 0])
-        box.translate([px, py, pz])
+        # 도로 표면 z=0.01 (_flat_rect z=0.01이 TOP) → 차량 바닥을 도로에 정확히 붙임
+        box.translate([px, py, 0.01])
         return box
 
     # ── V2I 신호선 (LineSet) ─────────────────────────────────
     def _make_v2i_lineset(self, results: list):
-        pts   = [[0.0, 0.0, 0.5]]
+        pts   = [[0.0, 0.0, -18.0]]
         lines = []
         cols  = []
         for r in results:
             loc = r["actor"].get_location()
-            px, py, pz = self._c(loc.x, loc.y, loc.z)
+            px, py, _ = self._c(loc.x, loc.y, loc.z)   # Z 무시
             if abs(px) > 53 or abs(py) > 53:
                 continue
             idx = len(pts)
-            pts.append([px, py, max(pz, 0.5)])
+            pts.append([px, py, 0.5])   # 도로 표면에서 0.5m 위로 신호선
             lines.append([0, idx])
-            base = _O3D_RGB.get(r["type"], _O3D_RGB["unknown"])
+            base = _O3D_RGB.get(r.get("cnn_type", r.get("type", "unknown")), _O3D_RGB["unknown"])
             cols.append([base[0]*0.5, base[1]*0.5, base[2]*0.5])
         if not lines:
             return None
@@ -562,7 +698,7 @@ class V2IMapRenderer:
             px, py = self._c(loc.x, loc.y)[0:2]
             if abs(px) > 53 or abs(py) > 53:
                 continue
-            box = self._make_vehicle_box(r["actor"], r["type"])
+            box = self._make_vehicle_box(r["actor"], r.get("cnn_type", r.get("type", "unknown")))
             self.vis.add_geometry(box, reset_bounding_box=False)
             self._dyn_geoms.append(box)
 
@@ -579,6 +715,7 @@ class V2IMapRenderer:
         img_float = self.vis.capture_screen_float_buffer(do_render=True)
         img       = (np.asarray(img_float) * 255).astype(np.uint8)
         bgr       = img[:, :, 2::-1].copy()   # RGB → BGR
+        bgr       = cv2.flip(bgr, 1)           # 좌우 미러 보정: Open3D에서 East(+X)가 왼쪽으로 나오는 현상 수정
 
         if bgr.shape[:2] != (MAP_PX, MAP_PX):
             bgr = cv2.resize(bgr, (MAP_PX, MAP_PX))
@@ -586,8 +723,8 @@ class V2IMapRenderer:
         # ── cv2 오버레이 (범례·거리 라벨) ─────────────────────
         counts = {c: 0 for c in CLASSES}
         for r in results:
-            if r["type"] in counts:
-                counts[r["type"]] += 1
+            if r.get("cnn_type", r.get("type", "unknown")) in counts:
+                counts[r.get("cnn_type", r.get("type", "unknown"))] += 1
         bgr = self._draw_legend(bgr, counts, len(results))
 
         self._last_render = bgr
@@ -639,10 +776,30 @@ class V2IMonitorSystem:
             try:   self.img_queue.get_nowait()
             except queue.Empty: break
 
-        self.classifier          = VehicleClassifier()
-        self._classify_cache: dict[int, str]            = {}
+        # 카메라 역행렬 사전 계산 (카메라는 정적으로 위치 고정)
+        self._cam_inv_mat = np.array(
+            self.camera.get_transform().get_inverse_matrix()
+        )
+
+        # ── CNN 분류기 + Linear 비교 분류기 ─────────────────────
+        self.classifier     = VehicleClassifier()
+        self.lin_classifier = None
+        try:
+            self.lin_classifier = LinearVehicleClassifier()
+        except FileNotFoundError:
+            print("[V2I] Linear 모델 없음 — CNN만 사용 (python src/classifier.py 로 학습)")
+
+        # ── 라벨 투표 캐시 (플리커링 방지) ──────────────────────
+        # {vehicle_id: deque([label, label, ...], maxlen=VOTE_WINDOW)}
+        self._vote_cnn: dict[int, deque] = {}   # CNN 투표
+        self._vote_lin: dict[int, deque] = {}   # Linear 투표
+        self._stable_cnn: dict[int, str] = {}   # CNN 확정 라벨
+        self._stable_lin: dict[int, str] = {}   # Linear 확정 라벨
+
         self._occlusion_cache: dict[int, tuple[bool,int]] = {}
-        self._frame_idx          = 0
+        self._frame_idx = 0
+        self._vision_speed_cache: dict[int, float] = {}   # {carla_vid: vision_kmh}
+        self._vision_speed_frame:  dict[int, int]  = {}   # {carla_vid: last_matched_frame}
 
         self.vision_proc = VisionProcessor()
 
@@ -670,9 +827,57 @@ class V2IMonitorSystem:
         return not visible
 
     # ─────────────────────────────────────────────────────────
+    def _vote_update(self, vid: int, cnn_lbl: str, cnn_conf: float,
+                     lin_lbl: str, lin_conf: float):
+        """투표 캐시 업데이트 → stable 라벨 갱신"""
+        # CNN 투표
+        if vid not in self._vote_cnn:
+            self._vote_cnn[vid] = deque(maxlen=VOTE_WINDOW)
+        if cnn_lbl != "uncertain" and cnn_conf >= CONF_THRESHOLD:
+            self._vote_cnn[vid].append(cnn_lbl)
+
+        # Linear 투표
+        if vid not in self._vote_lin:
+            self._vote_lin[vid] = deque(maxlen=VOTE_WINDOW)
+        if lin_lbl != "uncertain" and lin_conf >= CONF_THRESHOLD:
+            self._vote_lin[vid].append(lin_lbl)
+
+        def _majority(q, prev):
+            if not q:
+                return prev or "unknown"
+            cnt = Counter(q)
+            top_lbl, top_cnt = cnt.most_common(1)[0]
+            # 40% 이상 지지 시 확정
+            return top_lbl if top_cnt / len(q) >= 0.40 else (prev or "unknown")
+
+        self._stable_cnn[vid] = _majority(
+            self._vote_cnn[vid], self._stable_cnn.get(vid))
+        self._stable_lin[vid] = _majority(
+            self._vote_lin[vid], self._stable_lin.get(vid))
+
+    def _vote_cleanup(self, active_ids: set):
+        """사라진 차량의 투표 캐시 정리"""
+        for d in (self._vote_cnn, self._vote_lin,
+                  self._stable_cnn, self._stable_lin):
+            for old_id in list(d):
+                if old_id not in active_ids:
+                    del d[old_id]
+
+    # ─────────────────────────────────────────────────────────
     def _detect_and_classify(self, frame: np.ndarray) -> list:
+        """
+        CARLA actor 목록에서 가시 차량 검출 + 분류.
+
+        결과 dict 키:
+            actor       - CARLA Vehicle actor
+            bbox        - (x1,y1,x2,y2) 픽셀 BBox
+            gt_speed    - CARLA get_velocity() 기반 정답 속도 (km/h)
+            cnn_type    - CNN 투표 확정 라벨
+            lin_type    - Linear 투표 확정 라벨 (Linear 없으면 CNN과 동일)
+        """
         self._frame_idx += 1
         results = []
+
         for vehicle in self.world.get_actors().filter("vehicle.*"):
             vid = vehicle.id
 
@@ -688,153 +893,316 @@ class V2IMonitorSystem:
             if (x2-x1) < MIN_BBOX_PX or (y2-y1) < MIN_BBOX_PX:
                 continue
 
-            if (self._frame_idx % CLASSIFY_INTERVAL == 0
-                    or vid not in self._classify_cache):
-                crop  = frame[y1:y2, x1:x2]
-                vtype = self.classifier.classify(crop)
-                self._classify_cache[vid] = vtype
-            else:
-                vtype = self._classify_cache[vid]
+            # ── 분류 (CLASSIFY_INTERVAL마다 또는 첫 등장) ─────────
+            needs_cls = (
+                self._frame_idx % CLASSIFY_INTERVAL == 0
+                or vid not in self._stable_cnn
+            )
+            if needs_cls:
+                bw, bh = x2-x1, y2-y1
+                if bw >= MIN_BBOX_CLS and bh >= MIN_BBOX_CLS:
+                    crop = frame[y1:y2, x1:x2]
+                    cnn_lbl, cnn_conf = self.classifier.classify_with_conf(crop)
+                    if self.lin_classifier is not None:
+                        lin_lbl, lin_conf = self.lin_classifier.classify_with_conf(crop)
+                    else:
+                        lin_lbl, lin_conf = cnn_lbl, cnn_conf
+                else:
+                    # BBox 너무 작으면 기본값으로 투표
+                    cnn_lbl, cnn_conf = "car", 0.6
+                    lin_lbl, lin_conf = "car", 0.6
 
-            v     = vehicle.get_velocity()
-            speed = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
-            results.append({"actor": vehicle, "type": vtype,
-                             "bbox": bbox2, "speed": speed})
+                self._vote_update(vid, cnn_lbl, cnn_conf, lin_lbl, lin_conf)
+
+            cnn_type = self._stable_cnn.get(vid, "unknown")
+            lin_type = self._stable_lin.get(vid, "unknown")
+
+            # ── GT 속도 (CARLA 시뮬레이터 정답값) ─────────────────
+            v        = vehicle.get_velocity()
+            gt_speed = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
+
+            results.append({
+                "actor":    vehicle,
+                "bbox":     bbox2,
+                "gt_speed": gt_speed,
+                "cnn_type": cnn_type,
+                "lin_type": lin_type,
+            })
+
+        # 사라진 차량 캐시 정리
+        active_ids = {r["actor"].id for r in results}
+        self._vote_cleanup(active_ids)
+
         return results
 
     # ─────────────────────────────────────────────────────────
     def _draw_camera_view(self, frame: np.ndarray, results: list) -> np.ndarray:
+        """
+        BBox + 라벨 오버레이.
+
+        라벨 구조 (2줄):
+            윗줄: CNN 결과  [C bus  32km/h]  — CNN 색상
+            아랫줄: Linear  [L car        ]  — Linear 색상, 불일치 시 빨간 배경
+
+        정지 차량 노이즈 억제:
+            - gt_speed < 2.0 km/h → "0 km/h" 로 표시 (스냅)
+        """
+        counts_cnn = {c: 0 for c in CLASSES}
+        counts_lin = {c: 0 for c in CLASSES}
+        mismatch   = 0
+
         for r in results:
             x1, y1, x2, y2 = r["bbox"]
-            vtype = r["type"]
-            speed = r["speed"]
-            color = COLORS.get(vtype, COLORS["unknown"])
+            cnn_type = r["cnn_type"]
+            lin_type = r["lin_type"]
+            gt_speed = r["gt_speed"]
 
-            loc  = r["actor"].get_location()
-            dist = math.sqrt(
-                (loc.x - self.cam_tf.location.x)**2 +
-                (loc.y - self.cam_tf.location.y)**2 +
-                (loc.z - self.cam_tf.location.z)**2
-            )
+            # ── 정지 노이즈 억제: 5km/h 미만은 0으로 스냅 (Vision과 통일) ───────────
+            display_speed = 0.0 if gt_speed < 5.0 else gt_speed
 
-            # BBox (항공뷰: 얇게, 2px)
-            cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+            cnn_col = COLORS.get(cnn_type, COLORS["unknown"])
+            lin_col = COLORS.get(lin_type, COLORS["unknown"])
+            is_diff = (cnn_type != lin_type
+                       and cnn_type not in ("unknown",)
+                       and lin_type not in ("unknown",))
+            if is_diff:
+                mismatch += 1
 
-            # 라벨
-            label = f"{ICON.get(vtype,'?')} {speed:.0f}km/h"
-            (lw, lh), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-            ly = max(y1 - 4, lh + 2)
-            cv2.rectangle(frame, (x1, ly-lh-2), (x1+lw+4, ly+2), color, -1)
-            cv2.putText(frame, label, (x1+2, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
-                        (0,0,0), 1, cv2.LINE_AA)
+            if cnn_type in counts_cnn: counts_cnn[cnn_type] += 1
+            if lin_type in counts_lin: counts_lin[lin_type] += 1
 
-        # HUD 상단
+            # ── BBox: 불일치 시 노란 테두리 강조 ─────────────────────
+            bbox_col = (0, 220, 220) if is_diff else cnn_col
+            cv2.rectangle(frame, (x1,y1), (x2,y2), bbox_col, 2)
+
+            fs = 0.36; th = 1
+            vision_speed = r.get("vision_speed")  # None = IoU 미매핑
+
+            # ── 줄1: CNN 차종 + GT 속도 (CARLA 정답) ─────────────────
+            cnn_txt = f"C:{ICON.get(cnn_type,'?')}{cnn_type}  GT:{display_speed:.0f}"
+            (tw, tlh), _ = cv2.getTextSize(cnn_txt, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+            gap = tlh + 5
+            ty1 = max(y1 - gap*3 - 4, tlh + 4)
+            ty2 = ty1 + gap
+            ty3 = ty2 + gap
+
+            cv2.rectangle(frame, (x1, ty1-tlh-2), (x1+tw+4, ty1+2), (15,15,15), -1)
+            cv2.rectangle(frame, (x1, ty1-tlh-2), (x1+tw+4, ty1+2), cnn_col, 1)
+            cv2.putText(frame, cnn_txt, (x1+2, ty1),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, cnn_col, th, cv2.LINE_AA)
+
+            # ── 줄2: Vision 추정 속도 + 오차 ─────────────────────────
+            if vision_speed is not None:
+                err = abs(display_speed - vision_speed)
+                # 오차 색상: ≤5 초록 / ≤15 노랑 / 초과 빨강
+                spd_col = (0,210,80) if err<=5 else (0,200,255) if err<=15 else (50,50,255)
+                vis_txt = f"V:{vision_speed:.0f}  Err:{err:.0f}km/h"
+            else:
+                spd_col = (100, 100, 100)
+                vis_txt = "V:--"
+            (tw_v, _), _ = cv2.getTextSize(vis_txt, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+            cv2.rectangle(frame, (x1, ty2-tlh-2), (x1+tw_v+4, ty2+2), (15,15,15), -1)
+            cv2.rectangle(frame, (x1, ty2-tlh-2), (x1+tw_v+4, ty2+2), spd_col, 1)
+            cv2.putText(frame, vis_txt, (x1+2, ty2),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, spd_col, th, cv2.LINE_AA)
+
+            # ── 줄3: Linear 차종 (불일치 시 붉은 배경) ───────────────
+            lin_txt = f"L:{ICON.get(lin_type,'?')}{lin_type}"
+            (tw2, _), _ = cv2.getTextSize(lin_txt, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+            bg_col = (50, 15, 15) if is_diff else (15, 15, 15)
+            cv2.rectangle(frame, (x1, ty3-tlh-2), (x1+tw2+4, ty3+2), bg_col, -1)
+            cv2.rectangle(frame, (x1, ty3-tlh-2), (x1+tw2+4, ty3+2), lin_col, 1)
+            cv2.putText(frame, lin_txt, (x1+2, ty3),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, lin_col, th, cv2.LINE_AA)
+
+        # ── 상단 HUD ─────────────────────────────────────────────────
         hud = frame.copy()
-        cv2.rectangle(hud, (0,0), (IMG_W, 42), (0,0,0), -1)
+        cv2.rectangle(hud, (0,0), (IMG_W, 44), (0,0,0), -1)
         cv2.addWeighted(hud, 0.55, frame, 0.45, 0, frame)
 
-        title = (f"V2I Aerial View  |  {self._map_name}"
-                 f"  |  FPS {self._fps:.1f}  |  High={CAM_HEIGHT:.0f}m")
+        title = (f"V2I CCTV Monitor  |  {self._map_name}"
+                 f"  |  FPS {self._fps:.1f}"
+                 f"  |  H={CAM_HEIGHT:.0f}m / off={CAM_OFFSET:.0f}m")
         cv2.putText(frame, title, (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                     (255,255,255), 2, cv2.LINE_AA)
         cv2.putText(frame, title, (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                     (0,200,255), 1, cv2.LINE_AA)
 
-        # 우상단 카운트
-        counts = {c: 0 for c in CLASSES}
-        for r in results:
-            if r["type"] in counts: counts[r["type"]] += 1
-        px = IMG_W - 130
-        cv2.rectangle(frame, (px-6,46), (IMG_W-4, 46+len(CLASSES)*22+24),
-                      (0,0,0), -1)
+        # ── 우상단: CNN / Linear 카운트 나란히 ───────────────────────
+        px = IMG_W - 295
+        box_h = len(CLASSES)*24 + 68
+        cv2.rectangle(frame, (px-6,46), (IMG_W-4, 46+box_h), (0,0,0), -1)
+
+        # 열 헤더
+        cv2.putText(frame, "CNN",    (px+10, 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (100,200,255), 1)
+        cv2.putText(frame, "LINEAR", (px+120, 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,120,100), 1)
+        cv2.line(frame, (px-2,68), (IMG_W-4,68), (60,60,80), 1)
+
         for i, cls in enumerate(CLASSES):
-            cv2.putText(frame, f"{cls.upper()}: {counts[cls]}",
-                        (px, 64+i*22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50,
-                        COLORS[cls], 2, cv2.LINE_AA)
-        cv2.putText(frame, f"TOTAL: {len(results)}",
-                    (px, 64+len(CLASSES)*22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220,220,220), 1)
-        return frame
+            y_t = 82 + i*24
+            col = COLORS[cls]
+            cv2.putText(frame, f"{cls.upper()}: {counts_cnn[cls]}",
+                        (px, y_t),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, 1)
+            cv2.putText(frame, str(counts_lin.get(cls, 0)),
+                        (px+155, y_t),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, 1)
 
-    # ─────────────────────────────────────────────────────────
-    def _draw_vision_panel(self, frame: np.ndarray) -> np.ndarray:
-        """좌하단에 MOG2 + CentroidTracker 디버그 패널"""
-        dbg = self.vision_proc.get_debug_image()
-        if dbg is None:
-            return frame
-
-        # dbg는 좌우 합성(2배 폭) → 480×135 썸네일
-        panel_w, panel_h = 480, 135
-        panel  = cv2.resize(dbg, (panel_w, panel_h), interpolation=cv2.INTER_AREA)
-        border = 2
-        panel_b = cv2.copyMakeBorder(panel, border, border, border, border,
-                                     cv2.BORDER_CONSTANT, value=(0,200,200))
-        ph, pw = panel_b.shape[:2]
-
-        h, w   = frame.shape[:2]
-        margin = 10
-        ys, xs = h - ph - margin, margin
-
-        roi = frame[ys:ys+ph, xs:xs+pw].copy()
-        cv2.addWeighted(roi, 0.2, np.zeros_like(roi), 0.8, 0, roi)
-        frame[ys:ys+ph, xs:xs+pw] = roi
-        frame[ys:ys+ph, xs:xs+pw] = panel_b
-
+        sep_y = 82 + len(CLASSES)*24 + 2
+        cv2.line(frame, (px-2, sep_y), (IMG_W-4, sep_y), (60,60,80), 1)
         cv2.putText(frame,
-                    "[ VisionProcessor: MOG2 Mask | CentroidTracker ]",
-                    (xs, ys-6), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.40, (0,200,200), 1, cv2.LINE_AA)
+                    f"TOTAL: {len(results)}   불일치: {mismatch}",
+                    (px, sep_y+16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+
+        # ── 라벨 범례 (좌하단 작게) ──────────────────────────────────
+        cv2.putText(frame,
+                    "C=CNN(blue)  L=Linear(red)  yellow=mismatch",
+                    (8, IMG_H-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (120,140,160), 1)
+
         return frame
 
     # ─────────────────────────────────────────────────────────
-    def _compose_display(self, cam_frame: np.ndarray,
-                         radar: np.ndarray) -> np.ndarray:
-        h, w = cam_frame.shape[:2]
-        border = 2
-        margin = 10
+    def _compose_display(self,
+                         cam_frame: np.ndarray,
+                         radar:     np.ndarray,
+                         bev:       np.ndarray,
+                         dbg:       np.ndarray) -> np.ndarray:
+        """
+        1900×720 캔버스에 4개 패널을 분리 배치 (겹침 없음):
 
-        # 3D 레이더 (우하단)
-        framed = cv2.copyMakeBorder(
-            radar, border, border, border, border,
-            cv2.BORDER_CONSTANT, value=(0,160,255)
-        )
-        fh, fw = framed.shape[:2]
-        ys = h - fh - margin
-        xs = w - fw - margin
+          ┌───────────────────────┬────────────────────┐
+          │ CCTV View  1280×720   │ 3D V2I RADAR       │
+          │                       │      618×362        │
+          │                       ├────────────────────┤
+          │                       │ BEV  618×178        │
+          │                       ├────────────────────┤
+          │                       │ MOG2+Tracker 618×178│
+          └───────────────────────┴────────────────────┘
+        """
+        canvas = np.zeros((DISP_H, DISP_W, 3), dtype=np.uint8)
 
-        roi = cam_frame[ys:ys+fh, xs:xs+fw].copy()
-        cv2.addWeighted(roi, 0.18, np.zeros_like(roi), 0.82, 0, roi)
-        cam_frame[ys:ys+fh, xs:xs+fw] = roi
-        cam_frame[ys:ys+fh, xs:xs+fw] = framed
+        # ── 좌측: CCTV 뷰 (1280×720) ──────────────────────────
+        canvas[:DISP_H, :IMG_W] = cam_frame
 
-        cv2.putText(cam_frame, "[ 3D V2I RADAR (Open3D) ]",
-                    (xs, ys-6), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (0,160,255), 1, cv2.LINE_AA)
+        # 수직 구분선
+        canvas[:, IMG_W:IMG_W+2] = (55, 60, 72)
+        RX = IMG_W + 2                    # 우측 패널 시작 X (= 1282)
+        RW = DISP_W - RX                  # 우측 패널 너비 (≈ 618 px)
 
-        # Vision 패널 (좌하단)
-        cam_frame = self._draw_vision_panel(cam_frame)
-        return cam_frame
+        SEP = (55, 60, 72)  # 구분선 색
+
+        # ── 우측 상단: 3D V2I Radar ───────────────────────────
+        RAD_H = 362
+        rad_s = cv2.resize(radar, (RW, RAD_H))
+        canvas[:RAD_H, RX:RX+RW] = rad_s
+        cv2.putText(canvas, "[ 3D V2I RADAR ]",
+                    (RX+8, RAD_H-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 160, 255), 1, cv2.LINE_AA)
+        canvas[RAD_H:RAD_H+2, RX:] = SEP
+
+        # ── 우측 중간: BEV (Ground Projection) ───────────────
+        BEV_TOP = RAD_H + 2
+        BEV_H   = 178
+        bev_sq  = BEV_H - 4               # 정방형 BEV 크기
+        bev_s   = cv2.resize(bev, (bev_sq, bev_sq))
+        bev_panel = np.zeros((BEV_H, RW, 3), dtype=np.uint8)
+        bev_panel[2:2+bev_sq, 2:2+bev_sq] = bev_s
+        # BEV 오른쪽 여백에 레이블
+        cv2.putText(bev_panel, "[ BEV / Ground Projection ]",
+                    (bev_sq+8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev_panel, f"North-up  {BEV_RANGE:.0f}x{BEV_RANGE:.0f}m",
+                    (bev_sq+8, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (120, 140, 160), 1, cv2.LINE_AA)
+        canvas[BEV_TOP:BEV_TOP+BEV_H, RX:RX+RW] = bev_panel
+        canvas[BEV_TOP+BEV_H:BEV_TOP+BEV_H+2, RX:] = SEP
+
+        # ── 우측 하단: MOG2 Binary + CentroidTracker ─────────
+        DBG_TOP = BEV_TOP + BEV_H + 2
+        DBG_H   = DISP_H - DBG_TOP       # ≈ 178 px
+        if dbg is not None and DBG_H > 10:
+            dbg_s = cv2.resize(dbg, (RW, DBG_H))
+            canvas[DBG_TOP:DBG_TOP+DBG_H, RX:RX+RW] = dbg_s
+
+        return canvas
 
     # ─────────────────────────────────────────────────────────
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
         results = self._detect_and_classify(frame)
 
-        if self._frame_idx % VISION_UPDATE_INTERVAL == 0:
-            self.vision_proc.process_frame(frame)
+        # VisionProcessor → TrackedObject BBox를 CARLA BBox에 IoU 매핑
+        # → results 각 항목에 'vision_speed' 키 추가
+        tracked = self.vision_proc.process_frame(frame)
+
+        # TrackedObject (x,y,w,h) → (x1,y1,x2,y2) 변환
+        vis_boxes = []
+        for t in tracked:
+            vx, vy, vw, vh = t.bbox
+            vis_boxes.append((vx, vy, vx+vw, vy+vh, t.speed_kmh))
+
+        matched_r = set(); matched_v = set()
+        if results and vis_boxes:
+            def _iou(a, b):
+                ix1,iy1 = max(a[0],b[0]), max(a[1],b[1])
+                ix2,iy2 = min(a[2],b[2]), min(a[3],b[3])
+                inter = max(0,ix2-ix1)*max(0,iy2-iy1)
+                if inter==0: return 0.0
+                return inter/max((a[2]-a[0])*(a[3]-a[1])+(b[2]-b[0])*(b[3]-b[1])-inter,1e-6)
+            iou_mat = [[_iou(r["bbox"], vb[:4]) for vb in vis_boxes] for r in results]
+            flat = sorted(range(len(results)*len(vis_boxes)),
+                          key=lambda k: -iou_mat[k//len(vis_boxes)][k%len(vis_boxes)])
+            for k in flat:
+                ci, vi = k//len(vis_boxes), k%len(vis_boxes)
+                if iou_mat[ci][vi] < 0.20: break
+                if ci in matched_r or vi in matched_v: continue
+                matched_r.add(ci); matched_v.add(vi)
+                self._vision_speed_cache[results[ci]["actor"].id] = vis_boxes[vi][4]
+                self._vision_speed_frame[results[ci]["actor"].id] = self._frame_idx
+
+        # [v4] 매칭 안 된 차량의 캐시 속도: 3프레임 이상 미매칭이면 None 처리
+        # (정지 차량이 MOG2에서 사라져도 이전 속도가 display되는 문제 방지)
+        VISION_STALE_FRAMES = 3
+        active = {r["actor"].id for r in results}
+        for r in results:
+            vid  = r["actor"].id
+            last = self._vision_speed_frame.get(vid, -999)
+            if self._frame_idx - last <= VISION_STALE_FRAMES:
+                r["vision_speed"] = self._vision_speed_cache.get(vid)
+            else:
+                r["vision_speed"] = None   # 오래된 캐시는 사용 안 함
+        for old in list(self._vision_speed_cache):
+            if old not in active:
+                del self._vision_speed_cache[old]
+                self._vision_speed_frame.pop(old, None)
 
         display = self._draw_camera_view(frame.copy(), results)
+        # V2IMapRenderer는 cnn_type 키로 차종 색상 결정
         radar   = self.radar.render(results)
-        display = self._compose_display(display, radar)
+
+        # BEV 정사영 (사전 계산된 cam_inv_mat 재사용 → 빠름)
+        bev = compute_bev(
+            frame,
+            self._cam_inv_mat,
+            self.K,
+            self.junction_center.x,
+            self.junction_center.y,
+            self.junction_center.z,
+        )
+        bev = draw_bev_overlay(bev, self.radar.road_hw)
+
+        dbg     = self.vision_proc.get_debug_image()
+        output  = self._compose_display(display, radar, bev, dbg)
 
         now          = time.time()
         self._fps    = 1.0 / max(now - self._t_last, 1e-6)
         self._t_last = now
-        return display
+        return output
 
     # ─────────────────────────────────────────────────────────
     def _respawn_npcs(self):
@@ -847,13 +1215,17 @@ class V2IMonitorSystem:
         self.world.tick()
         self.npc_list = spawn_npc_vehicles(
             self.client, self.world, self.tm, NUM_NPC)
-        self._classify_cache.clear()
+        # 투표 캐시 + 확정 라벨 모두 초기화
+        self._vote_cnn.clear()
+        self._vote_lin.clear()
+        self._stable_cnn.clear()
+        self._stable_lin.clear()
         self._occlusion_cache.clear()
 
     # ─────────────────────────────────────────────────────────
     def run(self):
-        cv2.namedWindow("V2I Aerial Monitor", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("V2I Aerial Monitor", IMG_W, IMG_H)
+        cv2.namedWindow("V2I Monitor", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("V2I Monitor", DISP_W, DISP_H)
         print("[V2I] 관제 시작  q=종료  r=NPC재소환")
 
         while True:
@@ -874,7 +1246,7 @@ class V2IMonitorSystem:
                 )[:, :, :3].copy()
 
                 display = self.process_frame(arr)
-                cv2.imshow("V2I Aerial Monitor", display)
+                cv2.imshow("V2I Monitor", display)
 
             except Exception:
                 traceback.print_exc()
