@@ -200,6 +200,8 @@ python src/youtube_cctv_monitor.py --webcam 0
 - **BEV 역투영** — `compute_bev()`는 각 BEV 픽셀 → 지면 평면(z=junc_z) 월드 좌표 → 카메라 투영(`cam_inv @ pts_world`)으로 원본 프레임 색을 샘플링하는 정사영(inverse warping) 방식이며, North-up(`v=0`→North, East=+X, South=+Y) 그리드로 구성됩니다.
 - **Open3D 미러 보정** — `main_system.py`에서 Open3D 캡처 화면에 `cv2.flip(bgr, 1)`을 적용합니다(주석: "좌우 미러 보정: Open3D에서 East(+X)가 왼쪽으로 나오는 현상 수정").
 
+> **한계** — 위 좌표·축·미러 정합은 맞췄지만, `compute_bev()`는 full-frame IPM(전체 화면 역투영)이라 지면 평면을 가정합니다. 그래서 지면 위로 솟은 차량은 원거리에서 줄무늬처럼 번지고, BEV 영상 자체의 품질은 제한적입니다. 또 GT(actor 투영) 기반 관제 파이프라인에서는 BEV가 실제 판단에 쓰이지 않습니다 — 차량 위치 표현은 GT 좌표 기반 3D 레이더(Open3D)가 더 정확하며, BEV는 보조 시각화에 그칩니다.
+
 ## 디렉터리 구조
 
 ```
