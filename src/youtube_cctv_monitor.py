@@ -43,7 +43,7 @@ except ImportError as e:
     _CLS_OK = False
     CLASSES = ["bus", "car", "truck", "van"]
 
-from vision_processor import VisionProcessor, ROI_POLYGON
+from vision_processor import VisionProcessor, ROI_POLYGON, PIXELS_PER_METER
 
 
 # =============================================
@@ -131,15 +131,16 @@ class RadarRenderer:
     레이더 중심 = IPM 출력 중앙 (200/PPM, 200/PPM) 에 해당.
     """
 
-    # IPM 출력 중심 (m) — VisionProcessor.PIXELS_PER_METER 와 동기화
-    _PPM = 14.0
-    _IPM_CENTER_M = 200.0 / _PPM   # ≈ 14.3 m
+    # IPM 출력 중심 (m) — VisionProcessor.PIXELS_PER_METER 를 단일 출처로 동기화
+    # (과거 14.0으로 어긋나 있던 값을 import로 묶어 불일치를 없앰)
+    _PPM = PIXELS_PER_METER        # = 18.18 (vision_processor와 동일)
+    _IPM_CENTER_M = 200.0 / _PPM   # ≈ 11.0 m
 
     def __init__(self, w: int = RADAR_W, h: int = RADAR_H):
         self.w = w
         self.h = h
         # IPM world 범위: 0 ~ 400/PPM m → 레이더 전체 폭에 매핑
-        self._world_range_x = 400.0 / self._PPM  # ≈ 28.6 m
+        self._world_range_x = 400.0 / self._PPM  # ≈ 22.0 m (IPM 400px = 22m)
         self._world_range_y = 400.0 / self._PPM
         self._scale_x = w / self._world_range_x   # px/m
         self._scale_y = h / self._world_range_y
