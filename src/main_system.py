@@ -6,7 +6,7 @@ main_system.py
 
 역할:
     - CARLA V2I 스마트 교차로 3D 관제 시스템 메인 루프
-    - 교차로 코너 CCTV (14m 높이 / 20m 오프셋 / pitch≈-35°)
+    - 교차로 코너 CCTV (12m 높이 / 22m 오프셋 / pitch −25°)
     - Occlusion Culling (cast_ray) 로 건물 뒤 차량 필터링
     - Open3D 3D V2I 레이더 맵 (Tesla 계기판 스타일)
     - VisionProcessor (MOG2 + CentroidTracker) 디버그 패널
@@ -47,12 +47,10 @@ TM_PORT    = 9000
 IMG_W      = 1280
 IMG_H      = 720
 CAM_FOV       = 110.0   # CCTV 화각
-CAM_HEIGHT    = 12.0     # CCTV 폴 높이 (실제 코너 폴: 7m)
-CAM_OFFSET    = 22.0    # 교차로 중심에서 오프셋 (줄임: 22→10 → 도로 경계 바로 바깥)
-                         # off=10/√2≈7.07m → cx=-35.8, cy=35.2 (도로 SW 경계 약 1.4m 바깥)
-CAM_PITCH_DEG = -25.0   # 도로를 향해 내려다봄 → 교차로 70% 위치에 보임
-                         # 계산: atan(7/10)=35° 아래, pitch=-20° → axis에서 15° 아래 = 70%
-CAM_YAW_OFFSET = -50.0    # 오프셋 없음: SW→NE 대각선 yaw=−45°
+CAM_HEIGHT    = 12.0    # CCTV 폴 높이(시뮬레이션 값; 실제 코너 폴은 약 7m)
+CAM_OFFSET    = 22.0    # 교차로 중심에서 수평 오프셋(대각선 분배: off=22/√2≈15.56m)
+CAM_PITCH_DEG = -25.0   # 도로를 향해 내려다보는 각도
+CAM_YAW_OFFSET = -50.0  # SW→NE 대각선(약 −45°)에 가산하는 yaw 보정
 
 # 디스플레이 창 크기 (CCTV + 우측 패널)
 DISP_W     = 1900       # 전체 창 너비 (CCTV 1280 + 우측 620)
@@ -326,7 +324,7 @@ def spawn_cctv_camera(world, junc_center):
         #8 South road avg_visible=15.7  score=19.63  (이전 위치)
 
     • 위치: 교차로 중심에서 NW 방향 (−X, −Y 각 CAM_OFFSET/√2 m)
-    • 시선: SE(yaw=+45°), pitch ≈ −24°
+    • 시선: 교차로 중심 방향(yaw은 CAM_YAW_OFFSET로 보정), pitch = −25°(CAM_PITCH_DEG)
     • FOV : 110° → North arm(좌상) + West arm(우하) + 교차로 전체 포착
     • 이유: 대각선 뷰로 2개 도로 암 + 교차로 전체가 시야에 들어와
             차량 인식 수가 South road 대비 약 60% 향상 (25.0 vs 15.7대)
@@ -627,7 +625,7 @@ class V2IMapRenderer:
 
     # ── V2I 신호선 (LineSet) ─────────────────────────────────
     def _make_v2i_lineset(self, results: list):
-        pts   = [[0.0, 0.0, -18.0]]
+        pts   = [[0.0, 0.0, CAM_HEIGHT]]   # 교차로 중심 위 CCTV 높이의 V2I 노드(과거 z=-18은 지면 아래였음)
         lines = []
         cols  = []
         for r in results:
